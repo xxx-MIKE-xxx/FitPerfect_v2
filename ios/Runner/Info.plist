@@ -22,10 +22,14 @@
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
-	<key>CFBundleVersion</key>
-	<string>$(FLUTTER_BUILD_NUMBER)</string>
-	<key>LSRequiresIPhoneOS</key>
-	<true/>
+        <key>CFBundleVersion</key>
+        <string>$(FLUTTER_BUILD_NUMBER)</string>
+        <key>NSCameraUsageDescription</key>
+        <string>This app records workout videos to analyze your form.</string>
+        <key>NSMicrophoneUsageDescription</key>
+        <string>The microphone is used to capture audio while recording workout videos.</string>
+        <key>LSRequiresIPhoneOS</key>
+        <true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
