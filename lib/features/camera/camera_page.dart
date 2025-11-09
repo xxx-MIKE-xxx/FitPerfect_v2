@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -100,22 +101,32 @@ class _CameraPageState extends State<CameraPage> {
 
       if (_isRecording) {
         final recording = await controller.stopVideoRecording();
-        final sessionDir = _sessionDir ?? await Paths.makeNewSessionDir();
-        final movieFile = Paths.movieFile(sessionDir);
-        if (await movieFile.exists()) {
-          await movieFile.delete();
+        final activeSessionDir = _sessionDir ?? await Paths.makeNewSessionDir();
+        final destinationPath = Paths.moviePath(activeSessionDir);
+        final sourcePath = recording.path;
+
+        final savedMoviePath = await Isolate.run(
+          () => _moveRecordingToSession(sourcePath, destinationPath),
+        );
+
+        if (!mounted) {
+          return;
         }
-        await recording.saveTo(movieFile.path);
 
         setState(() {
+          _sessionDir = activeSessionDir;
           _isRecording = false;
           _hasRecording = true;
-          _recordedVideoPath = movieFile.path;
+          _recordedVideoPath = savedMoviePath;
           _repetitionCount = 12;
         });
       } else {
         final sessionDir = await Paths.makeNewSessionDir();
         await controller.startVideoRecording();
+
+        if (!mounted) {
+          return;
+        }
 
         setState(() {
           _sessionDir = sessionDir;
@@ -126,8 +137,18 @@ class _CameraPageState extends State<CameraPage> {
         });
       }
     } on CameraException catch (e) {
+      if (mounted && _isRecording) {
+        setState(() {
+          _isRecording = false;
+        });
+      }
       _showSnackBar(e.description ?? 'Camera error: ${e.code}');
     } catch (e) {
+      if (mounted && _isRecording) {
+        setState(() {
+          _isRecording = false;
+        });
+      }
       _showSnackBar('Recording failed: $e');
     } finally {
       if (mounted) {
@@ -336,4 +357,35 @@ class _CameraPageState extends State<CameraPage> {
       ),
     );
   }
+}
+
+Future<String> _moveRecordingToSession(
+  String sourcePath,
+  String destinationPath,
+) async {
+  final sourceFile = File(sourcePath);
+  if (!await sourceFile.exists()) {
+    throw Exception('Recording source not found at $sourcePath');
+  }
+
+  final destinationFile = File(destinationPath);
+  final destinationDir = destinationFile.parent;
+  if (!await destinationDir.exists()) {
+    await destinationDir.create(recursive: true);
+  }
+
+  if (await destinationFile.exists()) {
+    await destinationFile.delete();
+  }
+
+  await sourceFile.copy(destinationFile.path);
+
+  try {
+    await sourceFile.delete();
+  } catch (_) {
+    // It's safe to ignore deletion errors because the OS will clean up
+    // temporary camera files if they linger.
+  }
+
+  return destinationFile.path;
 }
