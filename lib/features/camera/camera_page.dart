@@ -1,7 +1,7 @@
 import 'dart:io';
-import 'dart:isolate';
-
+// NOTE: no 'dart:isolate' import
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart'; // <- for compute()
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
@@ -23,7 +23,7 @@ class _CameraPageState extends State<CameraPage> {
   Future<void>? _initializeControllerFuture;
   bool _isRecording = false;
   bool _hasRecording = false;
-  bool _isProcessingRecording = false;
+  bool _isProcessingRecording = false; // spinner only during STOP/save
   int _repetitionCount = 0;
   Directory? _sessionDir;
   String? _recordedVideoPath;
@@ -74,7 +74,7 @@ class _CameraPageState extends State<CameraPage> {
       });
 
       await initializeFuture;
-      if (mounted) setState(() {}); 
+      if (mounted) setState(() {}); // re-check _canControlRecording
     } on CameraException catch (e) {
       setState(() {
         _cameraError = e.description ?? e.code;
@@ -86,84 +86,94 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
+  // Start recording without blocking the UI
+  Future<void> _startRecording(CameraController controller) async {
+    try {
+      await controller.startVideoRecording();
+    } on CameraException catch (e) {
+      if (!mounted) return;
+      setState(() => _isRecording = false);
+      _showSnackBar(e.description ?? 'Camera error: ${e.code}');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isRecording = false);
+      _showSnackBar('Recording failed: $e');
+    }
+  }
+
   Future<void> _toggleRecording() async {
     final controller = _cameraController;
-    if (controller == null) {
-      return;
-    }
+    if (controller == null) return;
 
-    setState(() {
-      _isProcessingRecording = true;
-    });
+    final starting = !_isRecording;
+    // Show spinner only on STOP (when we copy the file)
+    if (!starting) {
+      setState(() => _isProcessingRecording = true);
+    }
 
     try {
       await _initializeControllerFuture;
 
       if (_isRecording) {
-        final recording = await controller.stopVideoRecording();
-        final activeSessionDir = _sessionDir ?? await Paths.makeNewSessionDir();
-        final destinationPath = Paths.moviePath(activeSessionDir);
-        final sourcePath = recording.path;
+        // ===== STOP & SAVE (heavy work off UI thread) =====
+        final XFile raw = await controller.stopVideoRecording();
 
-        final savedMoviePath = await Isolate.run(
-          () => _moveRecordingToSession(sourcePath, destinationPath),
-        );
+        final Directory activeSessionDir =
+            _sessionDir ?? await Paths.makeNewSessionDir();
+        final String dstPath = Paths.moviePath(activeSessionDir);
+        final String srcPath = raw.path;
 
-        if (!mounted) {
-          return;
-        }
+        // Use compute with a top-level function; pass only Strings
+        final savedMoviePath = await compute(_copyRecording, {
+          'src': srcPath,
+          'dst': dstPath,
+        });
 
+        if (!mounted) return;
         setState(() {
           _sessionDir = activeSessionDir;
           _isRecording = false;
           _hasRecording = true;
           _recordedVideoPath = savedMoviePath;
-          _repetitionCount = 12;
+          _repetitionCount = 12; // placeholder until analysis wires in
         });
       } else {
+        // ===== START (don’t block the UI) =====
         final sessionDir = await Paths.makeNewSessionDir();
-        await controller.startVideoRecording();
-
-        if (!mounted) {
-          return;
-        }
-
+        if (!mounted) return;
         setState(() {
           _sessionDir = sessionDir;
-          _isRecording = true;
           _hasRecording = false;
           _recordedVideoPath = null;
           _repetitionCount = 0;
+          _isRecording = true;          // flip UI immediately
+          _isProcessingRecording = false;
         });
+
+        // Kick off recording in the background; if it fails, we revert flag
+        // ignore: discarded_futures
+        _startRecording(controller);
       }
     } on CameraException catch (e) {
-      if (mounted && _isRecording) {
-        setState(() {
-          _isRecording = false;
-        });
+      if (mounted && _isRecording && !starting) {
+        setState(() => _isRecording = false);
       }
       _showSnackBar(e.description ?? 'Camera error: ${e.code}');
     } catch (e) {
-      if (mounted && _isRecording) {
-        setState(() {
-          _isRecording = false;
-        });
+      if (mounted && _isRecording && !starting) {
+        setState(() => _isRecording = false);
       }
       _showSnackBar('Recording failed: $e');
     } finally {
-      if (mounted) {
-        setState(() {
-          _isProcessingRecording = false;
-        });
+      if (!starting && mounted) {
+        setState(() => _isProcessingRecording = false);
       }
     }
   }
 
   void _runAnalysis() {
     final videoPath = _recordedVideoPath;
-    if (videoPath == null) {
-      return;
-    }
+    if (videoPath == null) return;
 
     final session = FeedbackSession(
       exercise: widget.exercise,
@@ -181,12 +191,8 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   void _showSnackBar(String message) {
-    if (!mounted) {
-      return;
-    }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Widget _buildCameraPreview() {
@@ -225,9 +231,7 @@ class _CameraPageState extends State<CameraPage> {
           return Center(
             child: Text(
               'Failed to initialize the camera',
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface,
-              ),
+              style: TextStyle(color: Theme.of(context).colorScheme.onSurface),
             ),
           );
         }
@@ -260,12 +264,8 @@ class _CameraPageState extends State<CameraPage> {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    ColoredBox(
-                      color: Theme.of(context).colorScheme.surfaceVariant,
-                    ),
+                    ColoredBox(color: Theme.of(context).colorScheme.surfaceVariant),
                     _buildCameraPreview(),
-
-                    // ✅ Status overlay (kept)
                     Align(
                       alignment: Alignment.topRight,
                       child: Padding(
@@ -275,45 +275,52 @@ class _CameraPageState extends State<CameraPage> {
                             color: Colors.black.withOpacity(0.4),
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            children: [
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    _isRecording
-                                        ? Icons.fiber_manual_record
-                                        : Icons.stop_circle_outlined,
-                                    size: 14,
-                                    color: _isRecording ? Colors.redAccent : Colors.white,
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    _isRecording
-                                        ? 'Recording…'
-                                        : _hasRecording
-                                            ? 'Ready'
-                                            : 'Idle',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontWeight: FontWeight.bold,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      _isRecording
+                                          ? Icons.fiber_manual_record
+                                          : Icons.stop_circle_outlined,
+                                      size: 14,
+                                      color: _isRecording
+                                          ? Colors.redAccent
+                                          : Colors.white,
                                     ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                'Reps: $_repetitionCount',
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            ],
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      _isRecording
+                                          ? 'Recording…'
+                                          : _hasRecording
+                                              ? 'Ready'
+                                              : 'Idle',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Reps: $_repetitionCount',
+                                  style: const TextStyle(color: Colors.white),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       ),
                     ),
-
                     if (_isProcessingRecording)
                       const Align(
                         alignment: Alignment.center,
@@ -335,9 +342,8 @@ class _CameraPageState extends State<CameraPage> {
                         : 'Start Recording',
               ),
               style: FilledButton.styleFrom(
-                backgroundColor: _isRecording
-                    ? Colors.red
-                    : Theme.of(context).colorScheme.primary,
+                backgroundColor:
+                    _isRecording ? Colors.red : Theme.of(context).colorScheme.primary,
               ),
             ),
             const SizedBox(height: 12),
@@ -359,16 +365,18 @@ class _CameraPageState extends State<CameraPage> {
   }
 }
 
-Future<String> _moveRecordingToSession(
-  String sourcePath,
-  String destinationPath,
-) async {
-  final sourceFile = File(sourcePath);
+/// Top-level function used by `compute`.
+/// Copies from payload['src'] to payload['dst'] and returns the dst path.
+Future<String> _copyRecording(Map<String, String> payload) async {
+  final src = payload['src']!;
+  final dst = payload['dst']!;
+
+  final sourceFile = File(src);
   if (!await sourceFile.exists()) {
-    throw Exception('Recording source not found at $sourcePath');
+    throw Exception('Recording source not found at $src');
   }
 
-  final destinationFile = File(destinationPath);
+  final destinationFile = File(dst);
   final destinationDir = destinationFile.parent;
   if (!await destinationDir.exists()) {
     await destinationDir.create(recursive: true);
@@ -380,12 +388,10 @@ Future<String> _moveRecordingToSession(
 
   await sourceFile.copy(destinationFile.path);
 
+  // Optional: cleanup temp file
   try {
     await sourceFile.delete();
-  } catch (_) {
-    // It's safe to ignore deletion errors because the OS will clean up
-    // temporary camera files if they linger.
-  }
+  } catch (_) {}
 
   return destinationFile.path;
 }
