@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart'; // <- for compute()
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../common/paths.dart';
@@ -19,6 +20,9 @@ class CameraPage extends StatefulWidget {
 }
 
 class _CameraPageState extends State<CameraPage> {
+  static const MethodChannel _analysisChannel = MethodChannel('fitperfect/analysis');
+  static const double _sampledFps = 5.0;
+
   CameraController? _cameraController;
   Future<void>? _initializeControllerFuture;
   bool _isRecording = false;
@@ -27,6 +31,9 @@ class _CameraPageState extends State<CameraPage> {
   int _repetitionCount = 0;
   Directory? _sessionDir;
   String? _recordedVideoPath;
+  String? _yoloJsonPath;
+  int _framesAnalyzed = 0;
+  int _detections = 0;
   String? _cameraError;
 
   @override
@@ -111,10 +118,21 @@ class _CameraPageState extends State<CameraPage> {
       setState(() => _isProcessingRecording = true);
     }
 
+    bool analysisDialogVisible = false;
+
     try {
       await _initializeControllerFuture;
 
       if (_isRecording) {
+        if (mounted) {
+          analysisDialogVisible = true;
+          // ignore: discarded_futures
+          showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (_) => const _AnalyzingDialog(),
+          );
+        }
         // ===== STOP & SAVE (heavy work off UI thread) =====
         final XFile raw = await controller.stopVideoRecording();
 
@@ -129,14 +147,35 @@ class _CameraPageState extends State<CameraPage> {
           'dst': dstPath,
         });
 
+        _YoloSummary? summary;
+        try {
+          summary = await _runNativeYoloAnalysis(
+            videoPath: savedMoviePath,
+            sessionDir: activeSessionDir,
+          );
+        } on PlatformException catch (e) {
+          _showSnackBar('YOLO failed: ${e.message ?? e.code}');
+        } catch (e) {
+          _showSnackBar('YOLO failed: $e');
+        }
+
         if (!mounted) return;
         setState(() {
           _sessionDir = activeSessionDir;
           _isRecording = false;
           _hasRecording = true;
           _recordedVideoPath = savedMoviePath;
-          _repetitionCount = 12; // placeholder until analysis wires in
+          _yoloJsonPath = summary?.jsonPath;
+          _framesAnalyzed = summary?.framesProcessed ?? 0;
+          _detections = summary?.detections ?? 0;
+          _repetitionCount = summary?.detections ?? 0;
         });
+
+        if (summary != null) {
+          final message =
+              'Analyzed ${summary.framesProcessed} frames, ${summary.detections} detections. JSON saved to ${summary.jsonPath}';
+          _showSnackBar(message);
+        }
       } else {
         // ===== START (don’t block the UI) =====
         final sessionDir = await Paths.makeNewSessionDir();
@@ -146,8 +185,11 @@ class _CameraPageState extends State<CameraPage> {
           _hasRecording = false;
           _recordedVideoPath = null;
           _repetitionCount = 0;
-          _isRecording = true;          // flip UI immediately
+          _isRecording = true; // flip UI immediately
           _isProcessingRecording = false;
+          _yoloJsonPath = null;
+          _framesAnalyzed = 0;
+          _detections = 0;
         });
 
         // Kick off recording in the background; if it fails, we revert flag
@@ -165,26 +207,65 @@ class _CameraPageState extends State<CameraPage> {
       }
       _showSnackBar('Recording failed: $e');
     } finally {
+      if (analysisDialogVisible && mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
       if (!starting && mounted) {
         setState(() => _isProcessingRecording = false);
       }
     }
   }
 
+  Future<_YoloSummary> _runNativeYoloAnalysis({
+    required String videoPath,
+    required Directory sessionDir,
+  }) async {
+    final result = await _analysisChannel.invokeMapMethod<String, dynamic>(
+      'runYoloOnVideo',
+      {
+        'videoPath': videoPath,
+        'sessionDir': sessionDir.path,
+        'sampledFps': _sampledFps,
+      },
+    );
+
+    if (result == null) {
+      throw StateError('YOLO returned no data');
+    }
+
+    final jsonPath = result['jsonPath'] as String?;
+    final frames = (result['framesProcessed'] as num?)?.toInt();
+    final detections = (result['detections'] as num?)?.toInt();
+
+    if (jsonPath == null || frames == null || detections == null) {
+      throw StateError('YOLO response missing fields: $result');
+    }
+
+    return _YoloSummary(
+      jsonPath: jsonPath,
+      framesProcessed: frames,
+      detections: detections,
+    );
+  }
+
   void _runAnalysis() {
     final videoPath = _recordedVideoPath;
     if (videoPath == null) return;
 
+    final metrics = [
+      FeedbackMetric(label: 'Frames Processed', value: '$_framesAnalyzed'),
+      FeedbackMetric(label: 'Detections', value: '$_detections'),
+      if (_yoloJsonPath != null)
+        FeedbackMetric(label: 'Detections File', value: _yoloJsonPath!.split('/').last),
+    ];
+
     final session = FeedbackSession(
       exercise: widget.exercise,
       videoPath: videoPath,
-      metrics: const [
-        FeedbackMetric(label: 'Repetition Count', value: '12'),
-        FeedbackMetric(label: 'Average Tempo', value: '2.1s'),
-        FeedbackMetric(label: 'Range of Motion', value: 'Good'),
-      ],
-      summary:
-          'Solid baseline! Keep knees aligned over toes and maintain a steady tempo.',
+      metrics: metrics,
+      summary: _detections > 0
+          ? 'Detected $_detections objects across $_framesAnalyzed frames.'
+          : 'No detections were found in the sampled frames.',
     );
 
     context.push('/feedback', extra: session);
@@ -363,6 +444,39 @@ class _CameraPageState extends State<CameraPage> {
       ),
     );
   }
+}
+
+class _AnalyzingDialog extends StatelessWidget {
+  const _AnalyzingDialog();
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: () async => false,
+      child: AlertDialog(
+        content: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Text('Analyzing…'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _YoloSummary {
+  const _YoloSummary({
+    required this.jsonPath,
+    required this.framesProcessed,
+    required this.detections,
+  });
+
+  final String jsonPath;
+  final int framesProcessed;
+  final int detections;
 }
 
 /// Top-level function used by `compute`.
