@@ -4,31 +4,49 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 class Paths {
-  static const String _sessionsFolderName = 'sessions';
+  static const _sessionsDirectoryName = 'sessions';
 
-  /// Creates a new directory for storing artifacts of a recording session.
   static Future<Directory> makeNewSessionDir() async {
     final documentsDir = await getApplicationDocumentsDirectory();
-    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-');
-    final sessionDir = Directory(
-      p.join(documentsDir.path, _sessionsFolderName, timestamp),
+    final sessionsRoot = Directory(
+      p.join(documentsDir.path, _sessionsDirectoryName),
     );
 
-    if (!await sessionDir.exists()) {
-      await sessionDir.create(recursive: true);
+    if (!await sessionsRoot.exists()) {
+      await sessionsRoot.create(recursive: true);
     }
 
-    return sessionDir;
+    Directory candidate;
+    var attempt = 0;
+    do {
+      final timestamp = _timestampSuffix();
+      final suffix = attempt == 0 ? '' : '-$attempt';
+      candidate = Directory(
+        p.join(sessionsRoot.path, 'session_$timestamp$suffix'),
+      );
+      attempt++;
+    } while (await candidate.exists());
+
+    await candidate.create(recursive: true);
+    return candidate;
   }
 
-  /// Returns the URI where the raw movie file should be stored.
-  static Uri movieUrl(Directory sessionDir) {
-    final filePath = p.join(sessionDir.path, 'movie.mov');
-    return Uri.file(filePath);
-  }
-
-  /// Convenience helper returning the file that backs [movieUrl].
   static File movieFile(Directory sessionDir) {
-    return File(movieUrl(sessionDir).toFilePath());
+    return File(p.join(sessionDir.path, 'movie.mov'));
+  }
+
+  static String moviePath(Directory sessionDir) => movieFile(sessionDir).path;
+
+  static Uri movieUri(Directory sessionDir) => Uri.file(moviePath(sessionDir));
+
+  static String _timestampSuffix() {
+    final now = DateTime.now().toUtc();
+    final year = now.year.toString().padLeft(4, '0');
+    final month = now.month.toString().padLeft(2, '0');
+    final day = now.day.toString().padLeft(2, '0');
+    final hour = now.hour.toString().padLeft(2, '0');
+    final minute = now.minute.toString().padLeft(2, '0');
+    final second = now.second.toString().padLeft(2, '0');
+    return '${year}${month}${day}_${hour}${minute}${second}';
   }
 }
