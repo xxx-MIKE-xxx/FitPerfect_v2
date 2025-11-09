@@ -3,7 +3,7 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
-  private let analyzer = VideoYOLOAnalyzer()
+  private let pipeline = VideoAnalysisPipeline()
 
   override func application(
     _ application: UIApplication,
@@ -18,7 +18,7 @@ import UIKit
       )
 
       channel.setMethodCallHandler { [weak self] call, result in
-        guard call.method == "runYoloOnVideo" else {
+        guard call.method == "runVideoAnalysis" else {
           result(FlutterMethodNotImplemented)
           return
         }
@@ -33,34 +33,54 @@ import UIKit
         }
 
         let sampledFps = (arguments["sampledFps"] as? Double) ?? 3.0
+        let personStrategyString = (arguments["person"] as? String) ?? PersonSelectionStrategy.bestScore.rawValue
+        let personStrategy = PersonSelectionStrategy(rawValue: personStrategyString) ?? .bestScore
 
-        self?.analyzer.analyze(
-          videoAtPath: videoPath,
+        self?.pipeline.run(
+          videoPath: videoPath,
           sessionDirectory: sessionDir,
-          sampledFps: sampledFps
-        ) { analysisResult in
-          switch analysisResult {
-          case let .success(summary):
-            NSLog(
-              "YOLO analysis complete. Frames: %d, detections: %d, json: %@",
-              summary.totals.framesProcessed,
-              summary.totals.detections,
-              summary.jsonURL.path
-            )
+          sampledFps: sampledFps,
+          personStrategy: personStrategy,
+          progress: { status in
             DispatchQueue.main.async {
-              result([
-                "jsonPath": summary.jsonURL.path,
-                "framesProcessed": summary.totals.framesProcessed,
-                "detections": summary.totals.detections
-              ])
+              channel.invokeMethod("analysisProgress", arguments: ["status": status])
             }
-          case let .failure(error):
-            NSLog("YOLO analysis failed: %@", error.localizedDescription)
+          },
+          completion: { pipelineResult in
             DispatchQueue.main.async {
-              result(FlutterError(code: "yolo_failed", message: error.localizedDescription, details: nil))
+              switch pipelineResult {
+              case let .success(summary):
+                var poseInfo: [String: Any] = [
+                  "frames": summary.rtmpose.totals.framesProcessed,
+                  "framesWithDetections": summary.rtmpose.totals.framesWithDetections,
+                  "jsonPath": summary.rtmpose.jsonURL.path,
+                  "numKeypoints": summary.rtmpose.numKeypoints
+                ]
+                if let preview = summary.rtmpose.previewURL {
+                  poseInfo["previewPath"] = preview.path
+                }
+
+                let response: [String: Any] = [
+                  "ok": true,
+                  "yolo": [
+                    "frames": summary.yolo.totals.framesProcessed,
+                    "detections": summary.yolo.totals.detections,
+                    "jsonPath": summary.yolo.jsonURL.path
+                  ],
+                  "rtmpose": poseInfo
+                ]
+                result(response)
+              case let .failure(error):
+                let response: [String: Any] = [
+                  "ok": false,
+                  "stage": error.stage.rawValue,
+                  "error": error.errorDescription ?? "Unknown error"
+                ]
+                result(response)
+              }
             }
           }
-        }
+        )
       }
     }
 
