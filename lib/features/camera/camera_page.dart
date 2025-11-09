@@ -32,20 +32,50 @@ class _CameraPageState extends State<CameraPage> {
   Directory? _sessionDir;
   String? _recordedVideoPath;
   String? _yoloJsonPath;
+  String? _poseJsonPath;
+  String? _posePreviewPath;
   int _framesAnalyzed = 0;
   int _detections = 0;
+  int _poseFramesProcessed = 0;
+  int _poseFramesWithDetections = 0;
+  int _poseKeypoints = 0;
   String? _cameraError;
+  final ValueNotifier<String> _analysisStatus = ValueNotifier<String>('Analyzing…');
 
   @override
   void initState() {
     super.initState();
+    _analysisChannel.setMethodCallHandler(_handleAnalysisCallbacks);
     _initializeCamera();
   }
 
   @override
   void dispose() {
+    _analysisChannel.setMethodCallHandler(null);
+    _analysisStatus.dispose();
     _cameraController?.dispose();
     super.dispose();
+  }
+
+  Future<void> _handleAnalysisCallbacks(MethodCall call) async {
+    if (call.method != 'analysisProgress') {
+      return;
+    }
+
+    final args = call.arguments;
+    String? status;
+    if (args is Map) {
+      final raw = args['status'];
+      if (raw is String) {
+        status = raw;
+      }
+    } else if (args is String) {
+      status = args;
+    }
+
+    if (status != null) {
+      _analysisStatus.value = status;
+    }
   }
 
   Future<void> _initializeCamera() async {
@@ -126,11 +156,12 @@ class _CameraPageState extends State<CameraPage> {
       if (_isRecording) {
         if (mounted) {
           analysisDialogVisible = true;
+          _analysisStatus.value = 'Analyzing…';
           // ignore: discarded_futures
           showDialog<void>(
             context: context,
             barrierDismissible: false,
-            builder: (_) => const _AnalyzingDialog(),
+            builder: (_) => _AnalyzingDialog(statusListenable: _analysisStatus),
           );
         }
         // ===== STOP & SAVE (heavy work off UI thread) =====
@@ -147,16 +178,18 @@ class _CameraPageState extends State<CameraPage> {
           'dst': dstPath,
         });
 
-        _YoloSummary? summary;
+        _AnalysisSummary? summary;
         try {
-          summary = await _runNativeYoloAnalysis(
+          summary = await _runNativeAnalysis(
             videoPath: savedMoviePath,
             sessionDir: activeSessionDir,
           );
         } on PlatformException catch (e) {
-          _showSnackBar('YOLO failed: ${e.message ?? e.code}');
+          final stage = e.details is Map ? (e.details['stage'] as String?) : null;
+          final stageInfo = stage == null ? '' : ' (${stage.toUpperCase()})';
+          _showSnackBar('Analysis$stageInfo failed: ${e.message ?? e.code}');
         } catch (e) {
-          _showSnackBar('YOLO failed: $e');
+          _showSnackBar('Analysis failed: $e');
         }
 
         if (!mounted) return;
@@ -165,15 +198,21 @@ class _CameraPageState extends State<CameraPage> {
           _isRecording = false;
           _hasRecording = true;
           _recordedVideoPath = savedMoviePath;
-          _yoloJsonPath = summary?.jsonPath;
-          _framesAnalyzed = summary?.framesProcessed ?? 0;
-          _detections = summary?.detections ?? 0;
-          _repetitionCount = summary?.detections ?? 0;
+          _yoloJsonPath = summary?.yoloJsonPath;
+          _poseJsonPath = summary?.poseJsonPath;
+          _posePreviewPath = summary?.posePreviewPath;
+          _framesAnalyzed = summary?.yoloFrames ?? 0;
+          _detections = summary?.yoloDetections ?? 0;
+          _poseFramesProcessed = summary?.poseFrames ?? 0;
+          _poseFramesWithDetections = summary?.poseDetections ?? 0;
+          _poseKeypoints = summary?.poseKeypoints ?? 0;
+          _repetitionCount = summary?.yoloDetections ?? 0;
         });
 
         if (summary != null) {
           final message =
-              'Analyzed ${summary.framesProcessed} frames, ${summary.detections} detections. JSON saved to ${summary.jsonPath}';
+              'YOLO: ${summary.yoloDetections} detections across ${summary.yoloFrames} frames. '
+              'RTMPose: ${summary.poseDetections}/${summary.poseFrames} frames with keypoints.';
           _showSnackBar(message);
         }
       } else {
@@ -188,8 +227,13 @@ class _CameraPageState extends State<CameraPage> {
           _isRecording = true; // flip UI immediately
           _isProcessingRecording = false;
           _yoloJsonPath = null;
+          _poseJsonPath = null;
+          _posePreviewPath = null;
           _framesAnalyzed = 0;
           _detections = 0;
+          _poseFramesProcessed = 0;
+          _poseFramesWithDetections = 0;
+          _poseKeypoints = 0;
         });
 
         // Kick off recording in the background; if it fails, we revert flag
@@ -209,19 +253,21 @@ class _CameraPageState extends State<CameraPage> {
     } finally {
       if (analysisDialogVisible && mounted) {
         Navigator.of(context, rootNavigator: true).pop();
+        analysisDialogVisible = false;
       }
       if (!starting && mounted) {
         setState(() => _isProcessingRecording = false);
       }
+      _analysisStatus.value = 'Analyzing…';
     }
   }
 
-  Future<_YoloSummary> _runNativeYoloAnalysis({
+  Future<_AnalysisSummary> _runNativeAnalysis({
     required String videoPath,
     required Directory sessionDir,
   }) async {
     final result = await _analysisChannel.invokeMapMethod<String, dynamic>(
-      'runYoloOnVideo',
+      'runVideoAnalysis',
       {
         'videoPath': videoPath,
         'sessionDir': sessionDir.path,
@@ -230,21 +276,52 @@ class _CameraPageState extends State<CameraPage> {
     );
 
     if (result == null) {
-      throw StateError('YOLO returned no data');
+      throw StateError('Analysis returned no data');
     }
 
-    final jsonPath = result['jsonPath'] as String?;
-    final frames = (result['framesProcessed'] as num?)?.toInt();
-    final detections = (result['detections'] as num?)?.toInt();
-
-    if (jsonPath == null || frames == null || detections == null) {
-      throw StateError('YOLO response missing fields: $result');
+    final ok = result['ok'] == true;
+    if (!ok) {
+      final stage = result['stage'] as String?;
+      final errorMessage = result['error'] as String? ?? 'Unknown error';
+      throw PlatformException(
+        code: 'analysis_failed',
+        message: errorMessage,
+        details: {'stage': stage},
+      );
     }
 
-    return _YoloSummary(
-      jsonPath: jsonPath,
-      framesProcessed: frames,
-      detections: detections,
+    final yolo = result['yolo'];
+    final pose = result['rtmpose'];
+    if (yolo is! Map || pose is! Map) {
+      throw StateError('Analysis response missing stage summaries: $result');
+    }
+
+    final yoloJsonPath = yolo['jsonPath'] as String?;
+    final yoloFrames = (yolo['frames'] as num?)?.toInt();
+    final yoloDetections = (yolo['detections'] as num?)?.toInt();
+
+    final poseJsonPath = pose['jsonPath'] as String?;
+    final poseFrames = (pose['frames'] as num?)?.toInt();
+    final poseDetections = (pose['framesWithDetections'] as num?)?.toInt();
+    final poseKeypoints = (pose['numKeypoints'] as num?)?.toInt() ?? 0;
+    final posePreviewPath = pose['previewPath'] as String?;
+
+    if (yoloJsonPath == null || yoloFrames == null || yoloDetections == null) {
+      throw StateError('YOLO summary missing fields: $result');
+    }
+    if (poseJsonPath == null || poseFrames == null || poseDetections == null) {
+      throw StateError('RTMPose summary missing fields: $result');
+    }
+
+    return _AnalysisSummary(
+      yoloJsonPath: yoloJsonPath,
+      yoloFrames: yoloFrames,
+      yoloDetections: yoloDetections,
+      poseJsonPath: poseJsonPath,
+      poseFrames: poseFrames,
+      poseDetections: poseDetections,
+      poseKeypoints: poseKeypoints,
+      posePreviewPath: posePreviewPath,
     );
   }
 
@@ -253,19 +330,34 @@ class _CameraPageState extends State<CameraPage> {
     if (videoPath == null) return;
 
     final metrics = [
-      FeedbackMetric(label: 'Frames Processed', value: '$_framesAnalyzed'),
-      FeedbackMetric(label: 'Detections', value: '$_detections'),
+      FeedbackMetric(label: 'YOLO Frames', value: '$_framesAnalyzed'),
+      FeedbackMetric(label: 'YOLO Detections', value: '$_detections'),
       if (_yoloJsonPath != null)
         FeedbackMetric(label: 'Detections File', value: _yoloJsonPath!.split('/').last),
+      FeedbackMetric(
+        label: 'RTMPose Frames',
+        value: '$_poseFramesProcessed',
+      ),
+      FeedbackMetric(
+        label: 'Frames With Keypoints',
+        value: '$_poseFramesWithDetections',
+      ),
+      if (_poseKeypoints > 0)
+        FeedbackMetric(label: 'Keypoints Per Person', value: '$_poseKeypoints'),
+      if (_poseJsonPath != null)
+        FeedbackMetric(label: 'Pose File', value: _poseJsonPath!.split('/').last),
+      if (_posePreviewPath != null)
+        FeedbackMetric(label: 'Pose Preview', value: _posePreviewPath!.split('/').last),
     ];
 
     final session = FeedbackSession(
       exercise: widget.exercise,
       videoPath: videoPath,
       metrics: metrics,
-      summary: _detections > 0
-          ? 'Detected $_detections objects across $_framesAnalyzed frames.'
-          : 'No detections were found in the sampled frames.',
+      summary: _poseFramesWithDetections > 0
+          ? 'YOLO detected $_detections objects across $_framesAnalyzed frames. '
+              'RTMPose produced keypoints for $_poseFramesWithDetections of $_poseFramesProcessed frames.'
+          : 'No pose keypoints were detected in the sampled frames.',
     );
 
     context.push('/feedback', extra: session);
@@ -447,36 +539,58 @@ class _CameraPageState extends State<CameraPage> {
 }
 
 class _AnalyzingDialog extends StatelessWidget {
-  const _AnalyzingDialog();
+  const _AnalyzingDialog({required this.statusListenable});
+
+  final ValueListenable<String> statusListenable;
 
   @override
   Widget build(BuildContext context) {
     return WillPopScope(
       onWillPop: () async => false,
       child: AlertDialog(
-        content: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: const [
-            CircularProgressIndicator(),
-            SizedBox(width: 16),
-            Text('Analyzing…'),
-          ],
+        content: ValueListenableBuilder<String>(
+          valueListenable: statusListenable,
+          builder: (context, status, _) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(width: 16),
+                Flexible(
+                  child: Text(
+                    status,
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
   }
 }
 
-class _YoloSummary {
-  const _YoloSummary({
-    required this.jsonPath,
-    required this.framesProcessed,
-    required this.detections,
+class _AnalysisSummary {
+  const _AnalysisSummary({
+    required this.yoloJsonPath,
+    required this.yoloFrames,
+    required this.yoloDetections,
+    required this.poseJsonPath,
+    required this.poseFrames,
+    required this.poseDetections,
+    required this.poseKeypoints,
+    this.posePreviewPath,
   });
 
-  final String jsonPath;
-  final int framesProcessed;
-  final int detections;
+  final String yoloJsonPath;
+  final int yoloFrames;
+  final int yoloDetections;
+  final String poseJsonPath;
+  final int poseFrames;
+  final int poseDetections;
+  final int poseKeypoints;
+  final String? posePreviewPath;
 }
 
 /// Top-level function used by `compute`.

@@ -2,6 +2,12 @@ import Foundation
 import AVFoundation
 import CoreML
 import Vision
+import UIKit
+
+enum PersonSelectionStrategy: String {
+    case bestScore
+    case largest
+}
 
 struct YOLODetectionBox: Codable {
     let cls: Int
@@ -44,7 +50,11 @@ enum YOLOAnalysisError: Error {
 }
 
 final class VideoYOLOAnalyzer {
-    private let queue = DispatchQueue(label: "com.fitperfect.yolo", qos: .userInitiated)
+    private var asset: AVAsset?
+    private var track: AVAssetTrack?
+    private var model: YOLOv3Tiny?
+    private var visionModel: VNCoreMLModel?
+    private var generator: AVAssetImageGenerator?
 
     private let classLabels: [String] = [
         "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
@@ -58,102 +68,121 @@ final class VideoYOLOAnalyzer {
         "teddy bear", "hair drier", "toothbrush"
     ]
 
-    func analyze(videoAtPath videoPath: String, sessionDirectory: String, sampledFps: Double, completion: @escaping (Result<YOLOAnalysisSummary, Error>) -> Void) {
-        queue.async {
-            do {
-                let videoURL = URL(fileURLWithPath: videoPath)
-                let asset = AVAsset(url: videoURL)
-                guard let track = asset.tracks(withMediaType: .video).first else {
-                    throw YOLOAnalysisError.videoTrackUnavailable
-                }
+    func analyze(
+        videoAtPath videoPath: String,
+        sessionDirectory: String,
+        sampledFps: Double
+    ) throws -> YOLOAnalysisSummary {
+        let videoURL = URL(fileURLWithPath: videoPath)
+        let asset = AVAsset(url: videoURL)
+        self.asset = asset
 
-                let configuration = MLModelConfiguration()
-                configuration.computeUnits = .all
-                guard let yolo = try? YOLOv3Tiny(configuration: configuration) else {
-                    throw YOLOAnalysisError.modelUnavailable
-                }
-                let visionModel = try VNCoreMLModel(for: yolo.model)
-
-                let transformedSize = track.naturalSize.applying(track.preferredTransform)
-                let videoWidth = Int(abs(transformedSize.width))
-                let videoHeight = Int(abs(transformedSize.height))
-
-                let fps = track.nominalFrameRate > 0 ? Double(track.nominalFrameRate) : self.estimateFrameRate(for: track)
-                let durationSeconds = CMTimeGetSeconds(asset.duration)
-
-                let generator = AVAssetImageGenerator(asset: asset)
-                generator.appliesPreferredTrackTransform = true
-                generator.requestedTimeToleranceAfter = .zero
-                generator.requestedTimeToleranceBefore = .zero
-
-                let effectiveSampledFps = max(sampledFps, 1.0)
-                let samplingStep = 1.0 / effectiveSampledFps
-                var frames: [YOLODetectionFrame] = []
-                var totalDetections = 0
-
-                var currentTime = 0.0
-                while currentTime < durationSeconds {
-                    autoreleasepool {
-                        let time = CMTime(seconds: currentTime, preferredTimescale: asset.duration.timescale)
-                        if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
-                            let frame = self.processFrame(
-                                cgImage: cgImage,
-                                timestamp: currentTime,
-                                model: visionModel,
-                                videoWidth: videoWidth,
-                                videoHeight: videoHeight
-                            )
-                            totalDetections += frame.boxes.count
-                            frames.append(frame)
-                        } else {
-                            let emptyFrame = YOLODetectionFrame(
-                                t: round(currentTime * 100) / 100,
-                                boxes: []
-                            )
-                            frames.append(emptyFrame)
-                        }
-                    }
-                    currentTime += samplingStep
-                }
-
-                let totals = YOLODetectionTotals(
-                    framesProcessed: frames.count,
-                    detections: totalDetections
-                )
-
-                let output = YOLODetectionOutput(
-                    videoWidth: videoWidth,
-                    videoHeight: videoHeight,
-                    fps: fps,
-                    sampledFps: effectiveSampledFps,
-                    frames: frames,
-                    totals: totals
-                )
-
-                let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
-                let jsonURL = sessionURL.appendingPathComponent("yolo_detections.json")
-
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                let data = try encoder.encode(output)
-                try data.write(to: jsonURL, options: .atomic)
-
-                let summary = YOLOAnalysisSummary(jsonURL: jsonURL, totals: totals)
-                completion(.success(summary))
-            } catch {
-                completion(.failure(error))
-            }
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            throw YOLOAnalysisError.videoTrackUnavailable
         }
+        self.track = track
+
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .all
+        guard let yoloModel = try? YOLOv3Tiny(configuration: configuration) else {
+            throw YOLOAnalysisError.modelUnavailable
+        }
+        model = yoloModel
+        visionModel = try VNCoreMLModel(for: yoloModel.model)
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceAfter = .zero
+        generator.requestedTimeToleranceBefore = .zero
+        self.generator = generator
+
+        let transformedSize = track.naturalSize.applying(track.preferredTransform)
+        let videoWidth = Int(abs(transformedSize.width))
+        let videoHeight = Int(abs(transformedSize.height))
+
+        let fps = track.nominalFrameRate > 0 ? Double(track.nominalFrameRate) : estimateFrameRate(for: track)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+
+        let effectiveSampledFps = max(sampledFps, 1.0)
+        let samplingStep = 1.0 / effectiveSampledFps
+
+        var frames: [YOLODetectionFrame] = []
+        var totalDetections = 0
+
+        var currentTime = 0.0
+        let timeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
+
+        while currentTime < durationSeconds {
+            autoreleasepool {
+                let time = CMTime(seconds: currentTime, preferredTimescale: timeScale)
+                if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                    let frame = self.processFrame(
+                        cgImage: cgImage,
+                        timestamp: currentTime,
+                        videoWidth: videoWidth,
+                        videoHeight: videoHeight
+                    )
+                    totalDetections += frame.boxes.count
+                    frames.append(frame)
+                } else {
+                    let emptyFrame = YOLODetectionFrame(
+                        t: round(currentTime * 100) / 100,
+                        boxes: []
+                    )
+                    frames.append(emptyFrame)
+                }
+            }
+            currentTime += samplingStep
+        }
+
+        let totals = YOLODetectionTotals(
+            framesProcessed: frames.count,
+            detections: totalDetections
+        )
+
+        let output = YOLODetectionOutput(
+            videoWidth: videoWidth,
+            videoHeight: videoHeight,
+            fps: fps,
+            sampledFps: effectiveSampledFps,
+            frames: frames,
+            totals: totals
+        )
+
+        let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+        let jsonURL = sessionURL.appendingPathComponent("yolo_detections.json")
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(output)
+            try data.write(to: jsonURL, options: .atomic)
+        } catch {
+            throw YOLOAnalysisError.failedToWriteJSON
+        }
+
+        return YOLOAnalysisSummary(jsonURL: jsonURL, totals: totals)
+    }
+
+    func teardown() {
+        generator = nil
+        visionModel = nil
+        model = nil
+        track = nil
+        asset = nil
     }
 
     private func processFrame(
         cgImage: CGImage,
         timestamp: Double,
-        model: VNCoreMLModel,
         videoWidth: Int,
         videoHeight: Int
     ) -> YOLODetectionFrame {
-        let request = VNCoreMLRequest(model: model)
+        guard let visionModel = visionModel else {
+            return YOLODetectionFrame(t: round(timestamp * 100) / 100, boxes: [])
+        }
+
+        let request = VNCoreMLRequest(model: visionModel)
         request.imageCropAndScaleOption = .scaleFill
 
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up)
@@ -207,5 +236,554 @@ final class VideoYOLOAnalyzer {
             return Double(minFrameDuration.timescale) / Double(minFrameDuration.value)
         }
         return 0
+    }
+}
+
+enum RTMPoseError: Error {
+    case modelUnavailable
+    case failedToLoadYOLO
+    case failedToWriteJSON
+    case invalidOutputs
+    case failedToCreatePreview
+}
+
+struct RTMPoseKeypoint: Codable {
+    let x: Double
+    let y: Double
+    let score: Double
+}
+
+struct RTMPoseFrame: Codable {
+    let t: Double
+    let ok: Bool
+    let keypoints: [RTMPoseKeypoint]
+}
+
+struct RTMPoseTotals: Codable {
+    let framesProcessed: Int
+    let framesWithDetections: Int
+}
+
+struct RTMPoseOutput: Codable {
+    struct InputSize: Codable {
+        let w: Int
+        let h: Int
+    }
+
+    let videoWidth: Int
+    let videoHeight: Int
+    let fps: Double
+    let sampledFps: Double
+    let numKeypoints: Int
+    let simccRatio: Double
+    let inputSize: InputSize
+    let frames: [RTMPoseFrame]
+    let totals: RTMPoseTotals
+}
+
+struct RTMPoseSummary {
+    let jsonURL: URL
+    let previewURL: URL?
+    let totals: RTMPoseTotals
+    let numKeypoints: Int
+}
+
+final class RTMPoseAnalyzer {
+    private let paddingFactor: Double
+    private let personStrategy: PersonSelectionStrategy
+
+    private var model: MLModel?
+    private var asset: AVAsset?
+    private var generator: AVAssetImageGenerator?
+
+    private let inputWidth = 192
+    private let inputHeight = 256
+    private let simccRatio: Double = 2.0
+    private let channelMeans: [Float] = [123.675, 116.28, 103.53]
+    private let channelStds: [Float] = [58.395, 57.12, 57.375]
+
+    private let skeletonPairs: [(Int, Int)] = [
+        (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16), (5, 1), (6, 2), (1, 3), (2, 4)
+    ]
+
+    init(paddingFactor: Double = 1.25, personStrategy: PersonSelectionStrategy = .bestScore) {
+        self.paddingFactor = paddingFactor
+        self.personStrategy = personStrategy
+    }
+
+    func analyze(
+        videoAtPath videoPath: String,
+        sessionDirectory: String,
+        yoloJSONURL: URL
+    ) throws -> RTMPoseSummary {
+        let jsonData: Data
+        do {
+            jsonData = try Data(contentsOf: yoloJSONURL)
+        } catch {
+            throw RTMPoseError.failedToLoadYOLO
+        }
+        let decoder = JSONDecoder()
+        let yoloOutput: YOLODetectionOutput
+        do {
+            yoloOutput = try decoder.decode(YOLODetectionOutput.self, from: jsonData)
+        } catch {
+            throw RTMPoseError.failedToLoadYOLO
+        }
+
+        let videoURL = URL(fileURLWithPath: videoPath)
+        let asset = AVAsset(url: videoURL)
+        self.asset = asset
+
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .all
+        guard let modelURL = Bundle.main.url(forResource: "RTMPose", withExtension: "mlmodelc") else {
+            throw RTMPoseError.modelUnavailable
+        }
+        model = try MLModel(contentsOf: modelURL, configuration: configuration)
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        self.generator = generator
+
+        var frames: [RTMPoseFrame] = []
+        var framesWithDetections = 0
+        var previewURL: URL?
+        var numKeypointsDetected = 0
+
+        let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+        let poseJSONURL = sessionURL.appendingPathComponent("rtmpose_keypoints.json")
+        let previewOutputURL = sessionURL.appendingPathComponent("rtmpose_preview.jpg")
+
+        let duration = asset.duration
+        let timeScale = duration.timescale != 0 ? duration.timescale : 600
+
+        for frame in yoloOutput.frames {
+            autoreleasepool {
+                guard let selectedBox = self.selectPersonBox(from: frame.boxes) else {
+                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
+                    frames.append(empty)
+                    return
+                }
+
+                let time = CMTime(seconds: frame.t, preferredTimescale: timeScale)
+                guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
+                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
+                    frames.append(empty)
+                    return
+                }
+
+                guard
+                    let prepared = self.prepareInput(
+                        from: cgImage,
+                        box: selectedBox,
+                        videoWidth: yoloOutput.videoWidth,
+                        videoHeight: yoloOutput.videoHeight
+                    ),
+                    let prediction = try? self.predictPose(from: prepared.array)
+                else {
+                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
+                    frames.append(empty)
+                    return
+                }
+
+                let decoded = self.decode(
+                    prediction: prediction,
+                    cropRect: prepared.cropRect,
+                    videoWidth: yoloOutput.videoWidth,
+                    videoHeight: yoloOutput.videoHeight
+                )
+
+                guard !decoded.keypoints.isEmpty else {
+                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
+                    frames.append(empty)
+                    return
+                }
+
+                if numKeypointsDetected == 0 {
+                    numKeypointsDetected = decoded.keypoints.count
+                }
+
+                frames.append(RTMPoseFrame(t: frame.t, ok: true, keypoints: decoded.keypoints))
+                framesWithDetections += 1
+
+                if previewURL == nil {
+                    if let generatedPreview = try? self.renderPreview(
+                        baseImage: cgImage,
+                        keypoints: decoded.keypoints,
+                        outputURL: previewOutputURL
+                    ) {
+                        previewURL = generatedPreview
+                    }
+                }
+            }
+        }
+
+        let totals = RTMPoseTotals(
+            framesProcessed: frames.count,
+            framesWithDetections: framesWithDetections
+        )
+
+        let output = RTMPoseOutput(
+            videoWidth: yoloOutput.videoWidth,
+            videoHeight: yoloOutput.videoHeight,
+            fps: yoloOutput.fps,
+            sampledFps: yoloOutput.sampledFps,
+            numKeypoints: numKeypointsDetected,
+            simccRatio: simccRatio,
+            inputSize: .init(w: inputWidth, h: inputHeight),
+            frames: frames,
+            totals: totals
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(output)
+            try data.write(to: poseJSONURL, options: .atomic)
+        } catch {
+            throw RTMPoseError.failedToWriteJSON
+        }
+
+        return RTMPoseSummary(
+            jsonURL: poseJSONURL,
+            previewURL: previewURL,
+            totals: totals,
+            numKeypoints: numKeypointsDetected
+        )
+    }
+
+    func teardown() {
+        generator = nil
+        asset = nil
+        model = nil
+    }
+
+    private func selectPersonBox(from boxes: [YOLODetectionBox]) -> YOLODetectionBox? {
+        let personBoxes = boxes.filter { $0.label == "person" }
+        guard !personBoxes.isEmpty else { return nil }
+        switch personStrategy {
+        case .bestScore:
+            return personBoxes.max(by: { $0.score < $1.score })
+        case .largest:
+            return personBoxes.max(by: { ($0.w * $0.h) < ($1.w * $1.h) })
+        }
+    }
+
+    private func prepareInput(
+        from image: CGImage,
+        box: YOLODetectionBox,
+        videoWidth: Int,
+        videoHeight: Int
+    ) -> (array: MLMultiArray, cropRect: CGRect)? {
+        let paddedRect = paddedBoundingBox(
+            for: box,
+            videoWidth: videoWidth,
+            videoHeight: videoHeight,
+            paddingFactor: paddingFactor
+        )
+
+        let imageHeight = image.height
+        let cropRect = CGRect(
+            x: paddedRect.minX,
+            y: paddedRect.minY,
+            width: paddedRect.width,
+            height: paddedRect.height
+        )
+
+        let cgCropRect = CGRect(
+            x: cropRect.minX,
+            y: Double(imageHeight) - cropRect.minY - cropRect.height,
+            width: cropRect.width,
+            height: cropRect.height
+        )
+
+        guard let cropped = image.cropping(to: cgCropRect.integral) else {
+            return nil
+        }
+
+        var pixels = [UInt8](repeating: 0, count: inputWidth * inputHeight * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = inputWidth * 4
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+        guard let context = CGContext(
+            data: &pixels,
+            width: inputWidth,
+            height: inputHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .high
+        context.draw(cropped, in: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight))
+
+        let pixelCount = inputWidth * inputHeight
+        var floatData = [Float](repeating: 0, count: pixelCount * 3)
+        for idx in 0..<pixelCount {
+            let base = idx * 4
+            let r = Float(pixels[base + 0])
+            let g = Float(pixels[base + 1])
+            let b = Float(pixels[base + 2])
+
+            floatData[idx] = (r - channelMeans[0]) / channelStds[0]
+            floatData[pixelCount + idx] = (g - channelMeans[1]) / channelStds[1]
+            floatData[(2 * pixelCount) + idx] = (b - channelMeans[2]) / channelStds[2]
+        }
+
+        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
+        guard let array = try? MLMultiArray(
+            shape: shape,
+            dataType: .float32
+        ) else {
+            return nil
+        }
+
+        floatData.withUnsafeBytes { buffer in
+            if let baseAddress = buffer.baseAddress {
+                memcpy(array.dataPointer, baseAddress, floatData.count * MemoryLayout<Float>.size)
+            }
+        }
+
+        return (array, cropRect)
+    }
+
+    private func predictPose(from array: MLMultiArray) throws -> MLFeatureProvider {
+        guard let model = model else {
+            throw RTMPoseError.modelUnavailable
+        }
+        let input = try MLDictionaryFeatureProvider(
+            dictionary: ["input": MLFeatureValue(multiArray: array)]
+        )
+        return try model.prediction(from: input)
+    }
+
+    private func decode(
+        prediction: MLFeatureProvider,
+        cropRect: CGRect,
+        videoWidth: Int,
+        videoHeight: Int
+    ) -> (keypoints: [RTMPoseKeypoint]) {
+        guard
+            let simccX = prediction.featureValue(for: "simcc_x")?.multiArrayValue,
+            let simccY = prediction.featureValue(for: "simcc_y")?.multiArrayValue
+        else {
+            return (keypoints: [])
+        }
+
+        let keypointCount = Int(truncating: simccX.shape[1])
+        let lengthX = Int(truncating: simccX.shape[2])
+        let lengthY = Int(truncating: simccY.shape[2])
+        guard
+            let valuesX = extractFloats(from: simccX),
+            let valuesY = extractFloats(from: simccY)
+        else {
+            return (keypoints: [])
+        }
+
+        var keypoints: [RTMPoseKeypoint] = []
+        keypoints.reserveCapacity(keypointCount)
+
+        let scaleX = cropRect.width / Double(inputWidth)
+        let scaleY = cropRect.height / Double(inputHeight)
+
+        for k in 0..<keypointCount {
+            let baseX = k * lengthX
+            let baseY = k * lengthY
+
+            var maxX: Float = -Float.greatestFiniteMagnitude
+            var idxX = 0
+            for idx in 0..<lengthX {
+                let value = valuesX[baseX + idx]
+                if value > maxX {
+                    maxX = value
+                    idxX = idx
+                }
+            }
+
+            var maxY: Float = -Float.greatestFiniteMagnitude
+            var idxY = 0
+            for idx in 0..<lengthY {
+                let value = valuesY[baseY + idx]
+                if value > maxY {
+                    maxY = value
+                    idxY = idx
+                }
+            }
+
+            let xIn = Double(idxX) / simccRatio
+            let yIn = Double(idxY) / simccRatio
+
+            let mappedX = min(Double(videoWidth), max(0, cropRect.minX + xIn * scaleX))
+            let mappedY = min(Double(videoHeight), max(0, cropRect.minY + yIn * scaleY))
+
+            let jointScore = max(0, min(1, Double((maxX + maxY) / 2.0)))
+            keypoints.append(RTMPoseKeypoint(x: mappedX, y: mappedY, score: jointScore))
+        }
+
+        return (keypoints: keypoints)
+    }
+
+    private func extractFloats(from multiArray: MLMultiArray) -> [Float]? {
+        let count = multiArray.count
+        switch multiArray.dataType {
+        case .float32:
+            let pointer = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
+        case .double:
+            let pointer = multiArray.dataPointer.bindMemory(to: Double.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        default:
+            return nil
+        }
+    }
+
+    private func renderPreview(
+        baseImage: CGImage,
+        keypoints: [RTMPoseKeypoint],
+        outputURL: URL
+    ) throws -> URL {
+        let width = baseImage.width
+        let height = baseImage.height
+        let size = CGSize(width: width, height: height)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { context in
+            let cgContext = context.cgContext
+            cgContext.draw(baseImage, in: CGRect(origin: .zero, size: size))
+            cgContext.setLineWidth(4)
+            cgContext.setLineCap(.round)
+            cgContext.setStrokeColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+            cgContext.setFillColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+
+            for (start, end) in skeletonPairs {
+                guard start < keypoints.count, end < keypoints.count else { continue }
+                let a = keypoints[start]
+                let b = keypoints[end]
+                if a.score <= 0 || b.score <= 0 { continue }
+                cgContext.move(to: CGPoint(x: a.x, y: a.y))
+                cgContext.addLine(to: CGPoint(x: b.x, y: b.y))
+                cgContext.strokePath()
+            }
+
+            let pointRadius: CGFloat = 6
+            for keypoint in keypoints where keypoint.score > 0 {
+                let rect = CGRect(
+                    x: keypoint.x - pointRadius / 2,
+                    y: keypoint.y - pointRadius / 2,
+                    width: pointRadius,
+                    height: pointRadius
+                )
+                cgContext.fillEllipse(in: rect)
+            }
+        }
+
+        guard let jpegData = image.jpegData(compressionQuality: 0.85) else {
+            throw RTMPoseError.failedToCreatePreview
+        }
+        try jpegData.write(to: outputURL, options: .atomic)
+        return outputURL
+    }
+
+    private func paddedBoundingBox(
+        for box: YOLODetectionBox,
+        videoWidth: Int,
+        videoHeight: Int,
+        paddingFactor: Double
+    ) -> CGRect {
+        let centerX = Double(box.x) + Double(box.w) / 2.0
+        let centerY = Double(box.y) + Double(box.h) / 2.0
+        let paddedWidth = Double(box.w) * paddingFactor
+        let paddedHeight = Double(box.h) * paddingFactor
+
+        var minX = centerX - paddedWidth / 2.0
+        var minY = centerY - paddedHeight / 2.0
+        var maxX = centerX + paddedWidth / 2.0
+        var maxY = centerY + paddedHeight / 2.0
+
+        minX = max(0, minX)
+        minY = max(0, minY)
+        maxX = min(Double(videoWidth), maxX)
+        maxY = min(Double(videoHeight), maxY)
+
+        return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
+    }
+}
+
+enum VideoAnalysisStage: String {
+    case yolo
+    case rtmpose
+}
+
+struct VideoAnalysisStageError: Error, LocalizedError {
+    let stage: VideoAnalysisStage
+    let underlying: Error
+
+    var errorDescription: String? {
+        if let localized = (underlying as NSError?)?.localizedDescription, !localized.isEmpty {
+            return localized
+        }
+        return String(describing: underlying)
+    }
+}
+
+struct VideoAnalysisResult {
+    let yolo: YOLOAnalysisSummary
+    let rtmpose: RTMPoseSummary
+}
+
+final class VideoAnalysisPipeline {
+    private let queue = DispatchQueue(label: "com.fitperfect.analysis", qos: .userInitiated)
+
+    func run(
+        videoPath: String,
+        sessionDirectory: String,
+        sampledFps: Double,
+        personStrategy: PersonSelectionStrategy = .bestScore,
+        progress: ((String) -> Void)?,
+        completion: @escaping (Result<VideoAnalysisResult, VideoAnalysisStageError>) -> Void
+    ) {
+        queue.async {
+            do {
+                progress?("Running YOLO…")
+                let yoloSummary: YOLOAnalysisSummary = try autoreleasepool {
+                    let analyzer = VideoYOLOAnalyzer()
+                    defer { analyzer.teardown() }
+                    return try analyzer.analyze(
+                        videoAtPath: videoPath,
+                        sessionDirectory: sessionDirectory,
+                        sampledFps: sampledFps
+                    )
+                }
+                NSLog("YOLO stage complete. Frames: %d, detections: %d", yoloSummary.totals.framesProcessed, yoloSummary.totals.detections)
+
+                progress?("Running RTMPose…")
+                let poseSummary: RTMPoseSummary = try autoreleasepool {
+                    let analyzer = RTMPoseAnalyzer(personStrategy: personStrategy)
+                    defer { analyzer.teardown() }
+                    return try analyzer.analyze(
+                        videoAtPath: videoPath,
+                        sessionDirectory: sessionDirectory,
+                        yoloJSONURL: yoloSummary.jsonURL
+                    )
+                }
+                NSLog("RTMPose stage complete. Frames: %d, detections: %d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
+
+                let result = VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary)
+                completion(.success(result))
+            } catch let stageError as VideoAnalysisStageError {
+                completion(.failure(stageError))
+            } catch let error as YOLOAnalysisError {
+                completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
+            } catch let error as RTMPoseError {
+                completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: error)))
+            } catch {
+                completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
+            }
+        }
     }
 }
