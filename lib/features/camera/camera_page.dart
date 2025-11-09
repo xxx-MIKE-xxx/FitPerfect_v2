@@ -73,6 +73,7 @@ class _CameraPageState extends State<CameraPage> {
       });
 
       await initializeFuture;
+      if (mounted) setState(() {}); 
     } on CameraException catch (e) {
       setState(() {
         _cameraError = e.description ?? e.code;
@@ -242,6 +243,8 @@ class _CameraPageState extends State<CameraPage> {
                       color: Theme.of(context).colorScheme.surfaceVariant,
                     ),
                     _buildCameraPreview(),
+
+                    // ✅ Status overlay (kept)
                     Align(
                       alignment: Alignment.topRight,
                       child: Padding(
@@ -251,82 +254,45 @@ class _CameraPageState extends State<CameraPage> {
                             color: Colors.black.withOpacity(0.4),
                             borderRadius: BorderRadius.circular(12),
                           ),
-                        )
-                      else if (_initializeCameraFuture == null)
-                        const Center(child: CircularProgressIndicator())
-                      else
-                        FutureBuilder<void>(
-                          future: _initializeCameraFuture,
-                          builder: (context, snapshot) {
-                            if (snapshot.connectionState == ConnectionState.done &&
-                                _cameraController != null) {
-                              return CameraPreview(_cameraController!);
-                            }
-                            if (snapshot.hasError) {
-                              return Center(
-                                child: Text(
-                                  'Camera error: ${snapshot.error}',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodyLarge
-                                      ?.copyWith(color: Colors.white),
-                                  textAlign: TextAlign.center,
-                                ),
-                              );
-                            }
-                            return const Center(child: CircularProgressIndicator());
-                          },
-                        ),
-                      Align(
-                        alignment: Alignment.topRight,
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.4),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              children: [
-                                Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      _isRecording
-                                          ? Icons.fiber_manual_record
-                                          : Icons.stop_circle_outlined,
-                                      size: 14,
-                                      color: _isRecording
-                                          ? Colors.redAccent
-                                          : Colors.white,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    _isRecording
+                                        ? Icons.fiber_manual_record
+                                        : Icons.stop_circle_outlined,
+                                    size: 14,
+                                    color: _isRecording ? Colors.redAccent : Colors.white,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    _isRecording
+                                        ? 'Recording…'
+                                        : _hasRecording
+                                            ? 'Ready'
+                                            : 'Idle',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.bold,
                                     ),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      _isRecording
-                                          ? 'Recording…'
-                                          : _hasRecording
-                                              ? 'Ready'
-                                              : 'Idle',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'Reps: $_repetitionCount',
-                                  style: const TextStyle(color: Colors.white),
-                                ),
-                              ],
-                            ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Reps: $_repetitionCount',
+                                style: const TextStyle(color: Colors.white),
+                              ),
+                            ],
                           ),
                         ),
                       ),
                     ),
+
                     if (_isProcessingRecording)
                       const Align(
                         alignment: Alignment.center,
