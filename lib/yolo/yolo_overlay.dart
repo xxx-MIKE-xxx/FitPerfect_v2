@@ -126,8 +126,8 @@ class _YoloPainter extends CustomPainter {
       ..strokeWidth = 2;
 
     for (final box in boxes) {
-      final left = dx + (box.x - box.w / 2) * scale;
-      final top = dy + (box.y - box.h / 2) * scale;
+      final left = dx + box.x * scale;
+      final top  = dy + box.y * scale;
       final rect = Rect.fromLTWH(left, top, box.w * scale, box.h * scale);
       canvas.drawRect(rect, rectPaint);
 

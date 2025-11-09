@@ -32,7 +32,7 @@ import UIKit
           return
         }
 
-        let sampledFps = (arguments["sampledFps"] as? Double) ?? 5.0
+        let sampledFps = (arguments["sampledFps"] as? Double) ?? 3.0
 
         self?.analyzer.analyze(
           videoAtPath: videoPath,
