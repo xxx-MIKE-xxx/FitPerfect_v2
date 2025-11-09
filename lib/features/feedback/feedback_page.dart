@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../models/feedback_session.dart';
+import '../../yolo/yolo_overlay.dart';
+import '../../yolo/yolo_result.dart';
 
 class FeedbackPage extends StatefulWidget {
   const FeedbackPage({super.key, required this.session});
@@ -18,15 +20,27 @@ class FeedbackPage extends StatefulWidget {
 class _FeedbackPageState extends State<FeedbackPage> {
   late final VideoPlayerController _videoController;
   late final Future<void> _initializeVideoFuture;
+  YoloResult? _yolo;
 
   @override
   void initState() {
     super.initState();
     _videoController = VideoPlayerController.file(File(widget.session.videoPath));
-    _initializeVideoFuture = _videoController.initialize().then((_) {
+    _initializeVideoFuture = _videoController.initialize().then((_) async {
       _videoController
         ..setLooping(true)
         ..setVolume(1.0);
+
+      final videoFile = File(widget.session.videoPath);
+      final jsonPath = '${videoFile.parent.path}/yolo_detections.json';
+      final result = await YoloResult.load(jsonPath);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _yolo = result;
+      });
     });
   }
 
@@ -92,6 +106,11 @@ class _FeedbackPageState extends State<FeedbackPage> {
                       alignment: Alignment.center,
                       children: [
                         VideoPlayer(_videoController),
+                        if (_yolo != null)
+                          YoloOverlay(
+                            controller: _videoController,
+                            result: _yolo!,
+                          ),
                         if (!_videoController.value.isPlaying)
                           IconButton(
                             iconSize: 72,
