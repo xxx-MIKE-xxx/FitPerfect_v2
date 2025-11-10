@@ -19,11 +19,13 @@ class FeedbackSession {
   final String videoPath;
   final List<FeedbackMetric> metrics;
   final String summary;
+  final String? poseJsonPath;
 
   const FeedbackSession({
     required this.exercise,
     required this.videoPath,
     required this.metrics,
     required this.summary,
+    this.poseJsonPath,
   });
 }

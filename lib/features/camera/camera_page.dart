@@ -358,6 +358,7 @@ class _CameraPageState extends State<CameraPage> {
           ? 'YOLO detected $_detections objects across $_framesAnalyzed frames. '
               'RTMPose produced keypoints for $_poseFramesWithDetections of $_poseFramesProcessed frames.'
           : 'No pose keypoints were detected in the sampled frames.',
+      poseJsonPath: _poseJsonPath,
     );
 
     context.push('/feedback', extra: session);
