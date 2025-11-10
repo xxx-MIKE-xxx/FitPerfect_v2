@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../models/feedback_session.dart';
+import '../../rtmpose/rtmpose_overlay.dart';
+import '../../rtmpose/rtmpose_result.dart';
 import '../../yolo/yolo_overlay.dart';
 import '../../yolo/yolo_result.dart';
 
@@ -21,6 +23,8 @@ class _FeedbackPageState extends State<FeedbackPage> {
   late final VideoPlayerController _videoController;
   late final Future<void> _initializeVideoFuture;
   YoloResult? _yolo;
+  RtmposeResult? _rtmpose;
+  bool _showPose = true;
 
   @override
   void initState() {
@@ -34,12 +38,24 @@ class _FeedbackPageState extends State<FeedbackPage> {
       final videoFile = File(widget.session.videoPath);
       final jsonPath = '${videoFile.parent.path}/yolo_detections.json';
       final result = await YoloResult.load(jsonPath);
+
+      final poseJsonPath = widget.session.poseJsonPath;
+      RtmposeResult? poseResult;
+      if (poseJsonPath != null) {
+        poseResult = await RtmposeResult.load(poseJsonPath);
+      }
+
+      final fallbackPosePath = '${videoFile.parent.path}/rtmpose_keypoints.json';
+      if (poseResult == null && fallbackPosePath != poseJsonPath) {
+        poseResult = await RtmposeResult.load(fallbackPosePath);
+      }
       if (!mounted) {
         return;
       }
 
       setState(() {
         _yolo = result;
+        _rtmpose = poseResult;
       });
     });
   }
@@ -110,6 +126,29 @@ class _FeedbackPageState extends State<FeedbackPage> {
                           YoloOverlay(
                             controller: _videoController,
                             result: _yolo!,
+                          ),
+                        if (_showPose && _rtmpose != null)
+                          RtmposeOverlay(
+                            controller: _videoController,
+                            result: _rtmpose!,
+                          ),
+                        if (_rtmpose != null)
+                          Positioned(
+                            top: 12,
+                            left: 12,
+                            child: FilledButton.tonalIcon(
+                              onPressed: () {
+                                setState(() {
+                                  _showPose = !_showPose;
+                                });
+                              },
+                              icon: Icon(
+                                _showPose
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
+                              ),
+                              label: Text(_showPose ? 'Pose On' : 'Pose Off'),
+                            ),
                           ),
                         if (!_videoController.value.isPlaying)
                           IconButton(
