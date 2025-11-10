@@ -112,6 +112,7 @@ final class VideoYOLOAnalyzer {
     private var visionModel: VNCoreMLModel?
     private var generator: AVAssetImageGenerator?
     private let personStrategy: PersonSelectionStrategy
+    private let frameRotation: Int
 
     private let classLabels: [String] = [
         "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat","traffic light",
@@ -127,6 +128,7 @@ final class VideoYOLOAnalyzer {
 
     init(personStrategy: PersonSelectionStrategy = .bestScore) {
         self.personStrategy = personStrategy
+        self.frameRotation = normalizedRotation(RTMPOSE_ROTATION_DEGREES)
     }
 
     func analyze(
@@ -173,15 +175,19 @@ final class VideoYOLOAnalyzer {
         var currentTime = 0.0
         let timeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
 
+        let rotation = frameRotation
+
         while currentTime < durationSeconds {
             autoreleasepool {
                 let time = CMTime(seconds: currentTime, preferredTimescale: timeScale)
                 if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                    let uprightImage = self.rotateForYOLOIfNeeded(cgImage, rotation: rotation)
                     let frame = self.processFrame(
-                        cgImage: cgImage,
+                        cgImage: uprightImage,
                         timestamp: currentTime,
                         videoWidth: videoWidth,
-                        videoHeight: videoHeight
+                        videoHeight: videoHeight,
+                        rotation: rotation
                     )
                     totalDetections += frame.boxes.count
                     frames.append(frame)
@@ -204,7 +210,7 @@ final class VideoYOLOAnalyzer {
         let meta = YOLODetectionMeta(
             bboxMode: YOLO_BBOX_MODE,
             coordsOrigin: YOLO_COORDS_ORIGIN,
-            rotationCorrectionDeg: RTMPOSE_ROTATION_DEGREES,
+            rotationCorrectionDeg: frameRotation,
             channelOrder: RTMPOSE_CHANNEL_ORDER
         )
 
@@ -248,11 +254,17 @@ final class VideoYOLOAnalyzer {
         asset = nil
     }
 
+    private func rotateForYOLOIfNeeded(_ image: CGImage, rotation: Int) -> CGImage {
+        guard rotation != 0 else { return image }
+        return rotateImage(image, clockwiseDegrees: rotation) ?? image
+    }
+
     private func processFrame(
         cgImage: CGImage,
         timestamp: Double,
         videoWidth: Int,
-        videoHeight: Int
+        videoHeight: Int,
+        rotation: Int
     ) -> YOLODetectionFrame {
         guard let visionModel = visionModel else {
             return YOLODetectionFrame(
@@ -276,7 +288,8 @@ final class VideoYOLOAnalyzer {
                     selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
                 )
             }
-
+            let rotatedWidth = cgImage.width
+            let rotatedHeight = cgImage.height
             var boxes: [YOLODetectionBox] = []
             for observation in observations {
                 guard let topLabel = observation.labels.first else { continue }
@@ -285,20 +298,32 @@ final class VideoYOLOAnalyzer {
 
                 // VN boxes are normalized in Vision coords: (0,0) bottom-left
                 let rect = observation.boundingBox
-                let width = Double(videoWidth)
-                let height = Double(videoHeight)
+                let width = Double(rotatedWidth)
+                let height = Double(rotatedHeight)
 
-                let x = Int((rect.minX * width).rounded())
-                let y = Int(((1.0 - rect.maxY) * height).rounded())
-                let w = Int((rect.width * width).rounded())
-                let h = Int((rect.height * height).rounded())
+                let xRot = rect.minX * width
+                let yRot = (1.0 - rect.maxY) * height
+                let wRot = rect.width * width
+                let hRot = rect.height * height
+
+                let rotatedRect = CGRect(x: xRot, y: yRot, width: wRot, height: hRot)
+                let mappedRect = mapRectFromRotated(
+                    rotatedRect,
+                    rotation: rotation,
+                    originalWidth: videoWidth,
+                    originalHeight: videoHeight
+                )
+                let clamped = clampRectToBounds(mappedRect, width: videoWidth, height: videoHeight)
 
                 boxes.append(
                     YOLODetectionBox(
                         cls: clsIndex,
                         label: label,
                         score: Double(topLabel.confidence),
-                        x: x, y: y, w: w, h: h
+                        x: Int(clamped.origin.x.rounded()),
+                        y: Int(clamped.origin.y.rounded()),
+                        w: Int(clamped.width.rounded()),
+                        h: Int(clamped.height.rounded())
                     )
                 )
             }
@@ -610,7 +635,7 @@ final class RTMPoseAnalyzer {
         guard let cropped = image.cropping(to: cgCrop) else { return nil }
 
         let rotated: CGImage
-        if rotation != 0, let r = rotate(image: cropped, clockwiseDegrees: rotation) {
+        if rotation != 0, let r = rotateImage(cropped, clockwiseDegrees: rotation) {
             rotated = r
         } else {
             rotated = cropped
@@ -784,31 +809,6 @@ final class RTMPoseAnalyzer {
         return CGPoint(x: tx + cx, y: ty + cy)
     }
 
-    private func rotate(image: CGImage, clockwiseDegrees deg: Int) -> CGImage? {
-        let rot = normalizedRotation(deg)
-        guard rot != 0 else { return image }
-        let w = CGFloat(image.width), h = CGFloat(image.height)
-        let swap = (rot == 90 || rot == 270)
-        let size = swap ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
-
-        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = 1
-        let renderer = UIGraphicsImageRenderer(size: size, format: fmt)
-        let img = renderer.image { ctx in
-            let g = ctx.cgContext
-            g.translateBy(x: size.width/2, y: size.height/2)
-            g.rotate(by: CGFloat(Double(rot) * Double.pi / 180.0))
-            g.translateBy(x: -w/2, y: -h/2)
-            g.interpolationQuality = .high
-            g.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        }
-        return img.cgImage
-    }
-
-    private func normalizedRotation(_ deg: Int) -> Int {
-        let n = ((deg % 360) + 360) % 360
-        return (n == 90 || n == 180 || n == 270) ? n : 0
-    }
-
     private func paddedRect(for box: YOLODetectionBox, videoW: Int, videoH: Int, pad: Double) -> CGRect {
         let cx = Double(box.x) + Double(box.w) / 2.0
         let cy = Double(box.y) + Double(box.h) / 2.0
@@ -906,4 +906,102 @@ final class VideoAnalysisPipeline {
             }
         }
     }
+}
+
+// =====================================================
+// MARK: – Shared helpers
+// =====================================================
+
+private func normalizedRotation(_ deg: Int) -> Int {
+    let n = ((deg % 360) + 360) % 360
+    switch n {
+    case 90, 180, 270:
+        return n
+    default:
+        return 0
+    }
+}
+
+private func rotateImage(_ image: CGImage, clockwiseDegrees deg: Int) -> CGImage? {
+    let rot = normalizedRotation(deg)
+    guard rot != 0 else { return image }
+
+    let w = CGFloat(image.width)
+    let h = CGFloat(image.height)
+    let swapAxes = (rot == 90 || rot == 270)
+    let size = swapAxes ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
+
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
+    let img = renderer.image { ctx in
+        let g = ctx.cgContext
+        g.translateBy(x: size.width / 2, y: size.height / 2)
+        g.rotate(by: CGFloat(Double(rot) * Double.pi / 180.0))
+        g.translateBy(x: -w / 2, y: -h / 2)
+        g.interpolationQuality = .high
+        g.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    }
+    return img.cgImage
+}
+
+private func mapRectFromRotated(
+    _ rect: CGRect,
+    rotation: Int,
+    originalWidth: Int,
+    originalHeight: Int
+) -> CGRect {
+    let rot = normalizedRotation(rotation)
+    guard originalWidth > 0, originalHeight > 0 else { return rect }
+    if rot == 0 { return rect }
+
+    let origW = Double(originalWidth)
+    let origH = Double(originalHeight)
+    let corners = [
+        rect.origin,
+        CGPoint(x: rect.maxX, y: rect.minY),
+        CGPoint(x: rect.minX, y: rect.maxY),
+        CGPoint(x: rect.maxX, y: rect.maxY)
+    ]
+
+    let mapped = corners.map { pointFromRotated($0, rotation: rot, originalWidth: origW, originalHeight: origH) }
+    let xs = mapped.map { $0.x }
+    let ys = mapped.map { $0.y }
+
+    guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else {
+        return rect
+    }
+
+    return CGRect(x: minX, y: minY, width: max(0, maxX - minX), height: max(0, maxY - minY))
+}
+
+private func pointFromRotated(
+    _ point: CGPoint,
+    rotation: Int,
+    originalWidth: Double,
+    originalHeight: Double
+) -> CGPoint {
+    switch rotation {
+    case 90:
+        return CGPoint(x: point.y, y: originalHeight - point.x)
+    case 180:
+        return CGPoint(x: originalWidth - point.x, y: originalHeight - point.y)
+    case 270:
+        return CGPoint(x: originalWidth - point.y, y: point.x)
+    default:
+        return point
+    }
+}
+
+private func clampRectToBounds(_ rect: CGRect, width: Int, height: Int) -> CGRect {
+    guard width > 0, height > 0 else { return .zero }
+    let maxW = Double(width)
+    let maxH = Double(height)
+
+    let minX = min(max(0.0, rect.minX), maxW)
+    let minY = min(max(0.0, rect.minY), maxH)
+    let maxX = min(max(0.0, rect.maxX), maxW)
+    let maxY = min(max(0.0, rect.maxY), maxH)
+
+    return CGRect(x: minX, y: minY, width: max(0.0, maxX - minX), height: max(0.0, maxY - minY))
 }
