@@ -4,6 +4,37 @@ import CoreML
 import Vision
 import UIKit
 
+// =====================================================
+// MARK: – Pipeline configuration (no calibration here)
+// =====================================================
+
+private let YOLO_BBOX_MODE               = "xywh_tl"
+private let YOLO_COORDS_ORIGIN           = "top_left"
+
+// Python probe picked rot=180 for your clip.
+// Change to 0 if your next video is upright.
+private let RTMPOSE_ROTATION_DEGREES     = 180
+
+// Python probe preferred BGR normalization.
+// Switch to "RGB" if you verify otherwise.
+private let RTMPOSE_CHANNEL_ORDER        = "BGR"
+
+// 1.25 * 1.15 ≈ 1.44  (your “+15%” room for limbs)
+private let RTMPOSE_DEFAULT_PADDING      = 1.44
+
+// RTMPose input + SIMCC
+private let RTMPOSE_INPUT_W              = 192
+private let RTMPOSE_INPUT_H              = 256
+private let RTMPOSE_SIMCC_RATIO: Double  = 2.0
+
+// ImageNet stats (OpenMMLab)
+private let RTMPOSE_MEANS: [Float]       = [123.675, 116.28, 103.53]
+private let RTMPOSE_STDS:  [Float]       = [58.395, 57.12, 57.375]
+
+// =====================================================
+// MARK: – YOLO stage types
+// =====================================================
+
 enum PersonSelectionStrategy: String {
     case bestScore
     case largest
@@ -70,6 +101,10 @@ enum YOLOAnalysisError: Error {
     case failedToWriteJSON
 }
 
+// =====================================================
+// MARK: – YOLO stage
+// =====================================================
+
 final class VideoYOLOAnalyzer {
     private var asset: AVAsset?
     private var track: AVAssetTrack?
@@ -79,15 +114,15 @@ final class VideoYOLOAnalyzer {
     private let personStrategy: PersonSelectionStrategy
 
     private let classLabels: [String] = [
-        "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
-        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-        "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa",
-        "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard",
-        "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-        "teddy bear", "hair drier", "toothbrush"
+        "person","bicycle","car","motorbike","aeroplane","bus","train","truck","boat","traffic light",
+        "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
+        "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
+        "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard",
+        "tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+        "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair","sofa",
+        "pottedplant","bed","diningtable","toilet","tvmonitor","laptop","mouse","remote","keyboard",
+        "cell phone","microwave","oven","toaster","sink","refrigerator","book","clock","vase","scissors",
+        "teddy bear","hair drier","toothbrush"
     ]
 
     init(personStrategy: PersonSelectionStrategy = .bestScore) {
@@ -151,6 +186,7 @@ final class VideoYOLOAnalyzer {
                     totalDetections += frame.boxes.count
                     frames.append(frame)
                 } else {
+                    // *** FIX: always include `selected` ***
                     let emptyFrame = YOLODetectionFrame(
                         t: round(currentTime * 100) / 100,
                         boxes: [],
@@ -162,16 +198,14 @@ final class VideoYOLOAnalyzer {
             currentTime += samplingStep
         }
 
-        let totals = YOLODetectionTotals(
-            framesProcessed: frames.count,
-            detections: totalDetections
-        )
+        let totals = YOLODetectionTotals(framesProcessed: frames.count, detections: totalDetections)
 
+        // Store meta so RTMPose can mirror what we used in Python
         let meta = YOLODetectionMeta(
-            bboxMode: "xywh_tl",
-            coordsOrigin: "top_left",
-            rotationCorrectionDeg: 0,
-            channelOrder: "RGB"
+            bboxMode: YOLO_BBOX_MODE,
+            coordsOrigin: YOLO_COORDS_ORIGIN,
+            rotationCorrectionDeg: RTMPOSE_ROTATION_DEGREES,
+            channelOrder: RTMPOSE_CHANNEL_ORDER
         )
 
         let output = YOLODetectionOutput(
@@ -197,6 +231,11 @@ final class VideoYOLOAnalyzer {
         } catch {
             throw YOLOAnalysisError.failedToWriteJSON
         }
+
+        // Debug banner (easy to spot in Xcode console)
+        NSLog("[YOLO] video=%dx%d fps=%.2f sampledFps=%.2f   meta{ bbox=%@, origin=%@, rot=%d, chan=%@ }",
+              videoWidth, videoHeight, fps, effectiveSampledFps,
+              meta.bboxMode, meta.coordsOrigin, meta.rotationCorrectionDeg, meta.channelOrder)
 
         return YOLOAnalysisSummary(jsonURL: jsonURL, totals: totals)
     }
@@ -230,7 +269,12 @@ final class VideoYOLOAnalyzer {
         do {
             try handler.perform([request])
             guard let observations = request.results as? [VNRecognizedObjectObservation] else {
-                return YOLODetectionFrame(t: round(timestamp * 100) / 100, boxes: [])
+                // *** FIX: always include `selected` ***
+                return YOLODetectionFrame(
+                    t: round(timestamp * 100) / 100,
+                    boxes: [],
+                    selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
+                )
             }
 
             var boxes: [YOLODetectionBox] = []
@@ -238,25 +282,25 @@ final class VideoYOLOAnalyzer {
                 guard let topLabel = observation.labels.first else { continue }
                 let label = topLabel.identifier
                 let clsIndex = classLabels.firstIndex(of: label) ?? -1
+
+                // VN boxes are normalized in Vision coords: (0,0) bottom-left
                 let rect = observation.boundingBox
                 let width = Double(videoWidth)
                 let height = Double(videoHeight)
 
                 let x = Int((rect.minX * width).rounded())
-                let y = Int(((1 - rect.maxY) * height).rounded())
+                let y = Int(((1.0 - rect.maxY) * height).rounded())
                 let w = Int((rect.width * width).rounded())
                 let h = Int((rect.height * height).rounded())
 
-                let box = YOLODetectionBox(
-                    cls: clsIndex,
-                    label: label,
-                    score: Double(topLabel.confidence),
-                    x: x,
-                    y: y,
-                    w: w,
-                    h: h
+                boxes.append(
+                    YOLODetectionBox(
+                        cls: clsIndex,
+                        label: label,
+                        score: Double(topLabel.confidence),
+                        x: x, y: y, w: w, h: h
+                    )
                 )
-                boxes.append(box)
             }
 
             let selectedIndex = self.selectPersonIndex(in: boxes)
@@ -296,14 +340,11 @@ final class VideoYOLOAnalyzer {
                 }
             }
         }
-
         return bestIndex
     }
 
     private func estimateFrameRate(for track: AVAssetTrack) -> Double {
-        if track.nominalFrameRate > 0 {
-            return Double(track.nominalFrameRate)
-        }
+        if track.nominalFrameRate > 0 { return Double(track.nominalFrameRate) }
         let minFrameDuration = track.minFrameDuration
         if minFrameDuration.isValid && minFrameDuration.value != 0 {
             return Double(minFrameDuration.timescale) / Double(minFrameDuration.value)
@@ -311,6 +352,10 @@ final class VideoYOLOAnalyzer {
         return 0
     }
 }
+
+// =====================================================
+// MARK: – RTMPose stage types
+// =====================================================
 
 enum RTMPoseError: Error {
     case modelUnavailable
@@ -346,7 +391,6 @@ struct RTMPoseJSONOutput: Codable {
     struct Debug: Codable {
         let simccXShape: [Int]
         let simccYShape: [Int]
-
         enum CodingKeys: String, CodingKey {
             case simccXShape = "simcc_x_shape"
             case simccYShape = "simcc_y_shape"
@@ -372,33 +416,30 @@ struct RTMPoseSummary {
     let numKeypoints: Int
 }
 
-// === Replace the whole RTMPoseAnalyzer with this version ===
+// =====================================================
+// MARK: – RTMPose (deterministic, no calibration)
+// =====================================================
+
 final class RTMPoseAnalyzer {
     private let paddingFactor: Double
     private let personStrategy: PersonSelectionStrategy
     private let rotationOverrideDegrees: Int
 
-    // Use the auto-generated wrapper, not a raw MLModel
     private var model: RTMPose?
     private var asset: AVAsset?
     private var generator: AVAssetImageGenerator?
     private var lastSimccShapes: ([Int], [Int])?
 
-    private let inputWidth = 192
-    private let inputHeight = 256
-    private let simccRatio: Double = 2.0
-    private let channelMeans: [Float] = [123.675, 116.28, 103.53]
-    private let channelStds: [Float] = [58.395, 57.12, 57.375]
-
+    // skeleton only for preview overlay
     private let skeletonPairs: [(Int, Int)] = [
         (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
         (11, 13), (13, 15), (12, 14), (14, 16), (5, 1), (6, 2), (1, 3), (2, 4)
     ]
 
     init(
-        paddingFactor: Double = 1.25,
+        paddingFactor: Double = RTMPOSE_DEFAULT_PADDING,
         personStrategy: PersonSelectionStrategy = .bestScore,
-        rotationOverrideDegrees: Int = 0
+        rotationOverrideDegrees: Int = RTMPOSE_ROTATION_DEGREES
     ) {
         self.paddingFactor = paddingFactor
         self.personStrategy = personStrategy
@@ -410,20 +451,18 @@ final class RTMPoseAnalyzer {
         sessionDirectory: String,
         yoloJSONURL: URL
     ) throws -> RTMPoseSummary {
-        // Load YOLO JSON as before
         let jsonData = try Data(contentsOf: yoloJSONURL)
-        let yoloOutput = try JSONDecoder().decode(YOLODetectionOutput.self, from: jsonData)
+        let yolo = try JSONDecoder().decode(YOLODetectionOutput.self, from: jsonData)
 
         lastSimccShapes = nil
 
-        // Video + model setup
+        // Video + model
         let videoURL = URL(fileURLWithPath: videoPath)
         let asset = AVAsset(url: videoURL)
         self.asset = asset
 
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndGPU   // more compatible than .all for this model
-        // Use generated wrapper
+        configuration.computeUnits = .cpuAndGPU
         self.model = try RTMPose(configuration: configuration)
 
         let generator = AVAssetImageGenerator(asset: asset)
@@ -435,110 +474,100 @@ final class RTMPoseAnalyzer {
         var frames: [RTMPoseFrame] = []
         var framesWithDetections = 0
         var previewURL: URL?
-        var numKeypointsDetected = 0
+        var maxK = 0
+
         let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
         let poseJSONURL = sessionURL.appendingPathComponent("rtmpose_keypoints.json")
         let previewOutputURL = sessionURL.appendingPathComponent("rtmpose_preview.jpg")
 
-        try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
+        let timeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
 
-        let duration = asset.duration
-        let timeScale = duration.timescale != 0 ? duration.timescale : 600
+        // Deterministic rotation from YOLO meta + override constant
+        let metaRotation = yolo.meta?.rotationCorrectionDeg ?? 0
+        let effectiveRotation = normalizedRotation(metaRotation + rotationOverrideDegrees)
 
-        let metaRotation = yoloOutput.meta?.rotationCorrectionDeg ?? 0
-        let effectiveRotation = normalizedRotationDegrees(metaRotation + rotationOverrideDegrees)
+        // Log once at the start so you can tweak quickly
+        NSLog("[RTMPose] input=%dx%d simccRatio=%.1f padding=%.2f rotation=%d channelOrder=%@",
+              RTMPOSE_INPUT_W, RTMPOSE_INPUT_H, RTMPOSE_SIMCC_RATIO,
+              paddingFactor, effectiveRotation, RTMPOSE_CHANNEL_ORDER)
 
-        for frame in yoloOutput.frames {
+        for fr in yolo.frames {
             autoreleasepool {
-                let hintIndex: Int?
-                if let selection = frame.selected, selection.index >= 0 {
-                    hintIndex = selection.index
-                } else {
-                    hintIndex = nil
-                }
-                guard let selectedBox = self.selectPersonBox(from: frame.boxes, hintIndex: hintIndex) else {
-                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
+                let hint = fr.selected?.index ?? -1
+                guard let box = self.pickPerson(fr.boxes, hint: hint) else {
+                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: []))
                     return
                 }
 
-                let time = CMTime(seconds: frame.t, preferredTimescale: timeScale)
+                let time = CMTime(seconds: fr.t, preferredTimescale: timeScale)
                 guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
-                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
-                    return
+                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: [])); return
                 }
 
                 guard
-                    let prepared = self.prepareInput(
+                    let prep = self.prepareInput(
                         from: cgImage,
-                        box: selectedBox,
-                        videoWidth: yoloOutput.videoWidth,
-                        videoHeight: yoloOutput.videoHeight,
-                        rotationDegrees: effectiveRotation
+                        box: box,
+                        videoW: yolo.videoWidth,
+                        videoH: yolo.videoHeight,
+                        rotation: effectiveRotation
                     ),
-                    let prediction = try? self.predictPose(from: prepared.array)
+                    let out = try? self.predict(prep.array)
                 else {
-                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
+                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: [])); return
+                }
+
+                let kps = self.decode(out, cropRect: prep.cropRect,
+                                      videoW: yolo.videoWidth, videoH: yolo.videoHeight,
+                                      rotation: prep.rotation)
+
+                if lastSimccShapes == nil {
+                    let sx = out.simcc_x.shape.map { Int(truncating: $0) }
+                    let sy = out.simcc_y.shape.map { Int(truncating: $0) }
+                    NSLog("[RTMPose] simcc_x shape=%@  simcc_y shape=%@", String(describing: sx), String(describing: sy))
+                }
+
+                if kps.isEmpty {
+                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: []))
                     return
                 }
 
-                let keypoints = self.decode(
-                    prediction: prediction,
-                    cropRect: prepared.cropRect,
-                    videoWidth: yoloOutput.videoWidth,
-                    videoHeight: yoloOutput.videoHeight,
-                    rotationDegrees: prepared.rotation
-                )
-
-                guard !keypoints.isEmpty else {
-                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
-                    return
-                }
-
-                // Track the maximum number of keypoints detected on any frame
-                numKeypointsDetected = max(numKeypointsDetected, keypoints.count)
-
-                frames.append(RTMPoseFrame(t: frame.t, ok: true, keypoints: keypoints))
+                maxK = max(maxK, kps.count)
+                frames.append(RTMPoseFrame(t: fr.t, ok: true, keypoints: kps))
                 framesWithDetections += 1
 
-                if previewURL == nil, let p = try? self.renderPreview(
-                    baseImage: cgImage,
-                    keypoints: keypoints,
-                    outputURL: previewOutputURL
-                ) {
+                if previewURL == nil, let p = try? self.renderPreview(baseImage: cgImage, keypoints: kps, outputURL: previewOutputURL) {
                     previewURL = p
                 }
             }
         }
 
-        let totals = RTMPoseTotals(
-            framesProcessed: frames.count,
-            framesWithDetections: framesWithDetections
-        )
+        let totals = RTMPoseTotals(framesProcessed: yolo.frames.count, framesWithDetections: framesWithDetections)
 
         let output = RTMPoseJSONOutput(
-            videoWidth: yoloOutput.videoWidth,
-            videoHeight: yoloOutput.videoHeight,
-            fps: yoloOutput.fps,
-            sampledFps: yoloOutput.sampledFps,
-            numKeypoints: numKeypointsDetected,
-            simccRatio: simccRatio,
-            inputSize: .init(w: inputWidth, h: inputHeight),
+            videoWidth: yolo.videoWidth,
+            videoHeight: yolo.videoHeight,
+            fps: yolo.fps,
+            sampledFps: yolo.sampledFps,
+            numKeypoints: maxK,
+            simccRatio: RTMPOSE_SIMCC_RATIO,
+            inputSize: .init(w: RTMPOSE_INPUT_W, h: RTMPOSE_INPUT_H),
             frames: frames,
             totals: totals,
             debug: lastSimccShapes.map { RTMPoseJSONOutput.Debug(simccXShape: $0.0, simccYShape: $0.1) }
         )
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(output)
-        try data.write(to: poseJSONURL, options: .atomic)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(output).write(to: poseJSONURL, options: .atomic)
 
-        return RTMPoseSummary(
-            jsonURL: poseJSONURL,
-            previewURL: previewURL,
-            totals: totals,
-            numKeypoints: numKeypointsDetected
-        )
+        NSLog("[RTMPose] frames=%d ok=%d  (meta rot=%d, used rot=%d, chan=%@, pad=%.2f)",
+              totals.framesProcessed, totals.framesWithDetections,
+              yolo.meta?.rotationCorrectionDeg ?? 0, effectiveRotation,
+              RTMPOSE_CHANNEL_ORDER, paddingFactor)
+
+        return RTMPoseSummary(jsonURL: poseJSONURL, previewURL: previewURL, totals: totals, numKeypoints: maxK)
     }
 
     func teardown() {
@@ -548,393 +577,285 @@ final class RTMPoseAnalyzer {
         lastSimccShapes = nil
     }
 
-    private func selectPersonBox(from boxes: [YOLODetectionBox], hintIndex: Int?) -> YOLODetectionBox? {
-        if let idx = hintIndex, idx >= 0, idx < boxes.count {
-            let candidate = boxes[idx]
-            if candidate.label == "person" {
-                return candidate
-            }
-        }
-        let personBoxes = boxes.filter { $0.label == "person" }
-        guard !personBoxes.isEmpty else { return nil }
+    // ---------------- helpers ----------------
+
+    private func pickPerson(_ boxes: [YOLODetectionBox], hint: Int) -> YOLODetectionBox? {
+        if hint >= 0, hint < boxes.count, boxes[hint].label == "person" { return boxes[hint] }
+        let ppl = boxes.filter { $0.label == "person" }
+        guard !ppl.isEmpty else { return nil }
         switch personStrategy {
-        case .bestScore: return personBoxes.max(by: { $0.score < $1.score })
-        case .largest:   return personBoxes.max(by: { ($0.w * $0.h) < ($1.w * $1.h) })
+        case .bestScore: return ppl.max(by: { $0.score < $1.score })
+        case .largest:   return ppl.max(by: { ($0.w * $0.h) < ($1.w * $1.h) })
         }
     }
 
     private func prepareInput(
         from image: CGImage,
         box: YOLODetectionBox,
-        videoWidth: Int,
-        videoHeight: Int,
-        rotationDegrees: Int
+        videoW: Int,
+        videoH: Int,
+        rotation: Int
     ) -> (array: MLMultiArray, cropRect: CGRect, rotation: Int)? {
-        let paddedRect = paddedBoundingBox(
-            for: box,
-            videoWidth: videoWidth,
-            videoHeight: videoHeight,
-            paddingFactor: paddingFactor
-        )
 
-        let imageHeight = image.height
-        let cropRect = CGRect(
-            x: paddedRect.minX, y: paddedRect.minY,
-            width: paddedRect.width, height: paddedRect.height
-        )
+        let crop = paddedRect(for: box, videoW: videoW, videoH: videoH, pad: paddingFactor)
 
-        // CoreGraphics uses origin at top-left; convert to CGImage coords (origin at top-left for CGImage)
-        let cgCropRect = CGRect(
-            x: cropRect.minX,
-            y: Double(imageHeight) - cropRect.minY - cropRect.height,
-            width: cropRect.width,
-            height: cropRect.height
-        )
+        let imageH = image.height
+        let cgCrop = CGRect(
+            x: crop.minX,
+            y: Double(imageH) - crop.minY - crop.height,
+            width: crop.width,
+            height: crop.height
+        ).integral
 
-        guard let cropped = image.cropping(to: cgCropRect.integral) else { return nil }
+        guard let cropped = image.cropping(to: cgCrop) else { return nil }
 
-        let rotation = normalizedRotationDegrees(rotationDegrees)
-        let rotatedImage: CGImage
-        if rotation != 0, let rotated = rotate(image: cropped, clockwiseDegrees: rotation) {
-            rotatedImage = rotated
+        let rotated: CGImage
+        if rotation != 0, let r = rotate(image: cropped, clockwiseDegrees: rotation) {
+            rotated = r
         } else {
-            rotatedImage = cropped
+            rotated = cropped
         }
 
-        var pixels = [UInt8](repeating: 0, count: inputWidth * inputHeight * 4)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bytesPerRow = inputWidth * 4
-        // Force BGRA layout (byteOrder32Little + premultipliedFirst)
-        let bitmapInfo: CGBitmapInfo = [
-            CGBitmapInfo.byteOrder32Little,
-            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
-        ]
-
-        guard let context = CGContext(
+        // Draw into BGRA buffer at model input size
+        var pixels = [UInt8](repeating: 0, count: RTMPOSE_INPUT_W * RTMPOSE_INPUT_H * 4)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = RTMPOSE_INPUT_W * 4
+        let bmpInfo: CGBitmapInfo = [ .byteOrder32Little,
+                                      CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue) ]
+        guard let ctx = CGContext(
             data: &pixels,
-            width: inputWidth,
-            height: inputHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo.rawValue
+            width: RTMPOSE_INPUT_W, height: RTMPOSE_INPUT_H,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+            space: cs, bitmapInfo: bmpInfo.rawValue
         ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(rotated, in: CGRect(x: 0, y: 0, width: RTMPOSE_INPUT_W, height: RTMPOSE_INPUT_H))
 
-        context.interpolationQuality = .high
-        context.draw(rotatedImage, in: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight))
+        // Build 1x3xH×W in the requested channel order (BGR or RGB)
+        let N = RTMPOSE_INPUT_W * RTMPOSE_INPUT_H
+        var floats = [Float](repeating: 0, count: N * 3)
 
-        let pixelCount = inputWidth * inputHeight
-        var floatData = [Float](repeating: 0, count: pixelCount * 3)
-        for idx in 0..<pixelCount {
-            let base = idx * 4
-            // BGRA (byteOrder32Little + premultipliedFirst)
-            let b = Float(pixels[base + 0])
-            let g = Float(pixels[base + 1])
-            let r = Float(pixels[base + 2])
+        for i in 0..<N {
+            let p = i * 4
+            // BGRA memory layout
+            let b = Float(pixels[p + 0])
+            let g = Float(pixels[p + 1])
+            let r = Float(pixels[p + 2])
 
-            floatData[idx]              = (r - channelMeans[0]) / channelStds[0]
-            floatData[pixelCount + idx] = (g - channelMeans[1]) / channelStds[1]
-            floatData[2 * pixelCount + idx] = (b - channelMeans[2]) / channelStds[2]
-        }
-
-        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
-        guard let array = try? MLMultiArray(shape: shape, dataType: .float32) else { return nil }
-        floatData.withUnsafeBytes { buf in
-            if let base = buf.baseAddress {
-                memcpy(array.dataPointer, base, floatData.count * MemoryLayout<Float>.size)
+            if RTMPOSE_CHANNEL_ORDER.uppercased() == "BGR" {
+                // Channel 0 ← B, 1 ← G, 2 ← R  (means/stds applied in this order)
+                floats[i]          = (b - RTMPOSE_MEANS[0]) / RTMPOSE_STDS[0]
+                floats[N + i]      = (g - RTMPOSE_MEANS[1]) / RTMPOSE_STDS[1]
+                floats[2 * N + i]  = (r - RTMPOSE_MEANS[2]) / RTMPOSE_STDS[2]
+            } else {
+                // Channel 0 ← R, 1 ← G, 2 ← B
+                floats[i]          = (r - RTMPOSE_MEANS[0]) / RTMPOSE_STDS[0]
+                floats[N + i]      = (g - RTMPOSE_MEANS[1]) / RTMPOSE_STDS[1]
+                floats[2 * N + i]  = (b - RTMPOSE_MEANS[2]) / RTMPOSE_STDS[2]
             }
         }
-        return (array, cropRect, rotation)
+
+        let shape: [NSNumber] = [1, 3, NSNumber(value: RTMPOSE_INPUT_H), NSNumber(value: RTMPOSE_INPUT_W)]
+        guard let arr = try? MLMultiArray(shape: shape, dataType: .float32) else { return nil }
+        floats.withUnsafeBytes { buf in
+            memcpy(arr.dataPointer, buf.baseAddress!, floats.count * MemoryLayout<Float>.size)
+        }
+        return (arr, crop, rotation)
     }
 
-    // Use the generated input/output types
-    private func predictPose(from array: MLMultiArray) throws -> RTMPoseOutput {
+    private func predict(_ input: MLMultiArray) throws -> RTMPoseOutput {
         guard let model = model else { throw RTMPoseError.modelUnavailable }
-        let input = RTMPoseInput(input: array)
-        return try model.prediction(input: input)
+        let inp = RTMPoseInput(input: input)
+        return try model.prediction(input: inp)
     }
 
     private func decode(
-        prediction: RTMPoseOutput,
+        _ out: RTMPoseOutput,
         cropRect: CGRect,
-        videoWidth: Int,
-        videoHeight: Int,
-        rotationDegrees: Int
+        videoW: Int,
+        videoH: Int,
+        rotation: Int
     ) -> [RTMPoseKeypoint] {
 
-        // Pull shapes/strides
-        let X = prediction.simcc_x
-        let Y = prediction.simcc_y
-        let dx = X.shape.map { Int(truncating: $0) }   // e.g. [1,17,384] or [1,384,17]
-        let dy = Y.shape.map { Int(truncating: $0) }   // e.g. [1,17,512] or [1,512,17]
-        let sx = X.strides.map { Int(truncating: $0) } // strides are in ELEMENTS
+        let X = out.simcc_x, Y = out.simcc_y
+        let dx = X.shape.map { Int(truncating: $0) }
+        let dy = Y.shape.map { Int(truncating: $0) }
+        let sx = X.strides.map { Int(truncating: $0) }
         let sy = Y.strides.map { Int(truncating: $0) }
-
         lastSimccShapes = (dx, dy)
 
-        // Helper to pick which dim is K (17/26/29) and which is W
         func dims(_ d: [Int]) -> (k: Int, w: Int, K: Int, W: Int) {
-            let candidates: Set<Int> = [17, 26, 29]
-            var kIdx: Int?
-            for idx in d.indices {
-                if candidates.contains(d[idx]) {
-                    kIdx = idx
-                    break
-                }
-            }
+            let cand: Set<Int> = [17, 26, 29]
+            var kIdx: Int? = d.firstIndex(where: { cand.contains($0) })
             if kIdx == nil {
-                kIdx = d.indices.sorted { d[$0] < d[$1] }.first
+                kIdx = (d.count >= 2 && d[d.count - 2] <= d.last!) ? d.count - 2 : d.count - 1
             }
-
-            var wIdx: Int?
-            for idx in d.indices.reversed() {
-                if idx != kIdx, d[idx] >= 100 {
-                    wIdx = idx
-                    break
-                }
-            }
-            if wIdx == nil {
-                wIdx = d.indices.reversed().first(where: { $0 != kIdx })
-            }
-
-            let resolvedK = kIdx ?? max(0, d.count - 2)
-            let resolvedW = wIdx ?? max(0, d.count - 1)
-            return (resolvedK, resolvedW, d[resolvedK], d[resolvedW])
+            var wIdx: Int? = (0..<d.count).reversed().first(where: { $0 != kIdx && d[$0] > 1 })
+            if wIdx == nil { wIdx = d.count - 1 }
+            let kk = kIdx ?? max(0, d.count - 2)
+            let ww = wIdx ?? max(0, d.count - 1)
+            return (kk, ww, d[kk], d[ww])
         }
 
-        let aX = dims(dx), aY = dims(dy)
-        let K  = min(aX.K, aY.K)
-        let WX = aX.W
-        let WY = aY.W
+        let ax = dims(dx), ay = dims(dy)
+        let K = min(ax.K, ay.K), WX = ax.W, WY = ay.W
 
-        // Type-safe raw readers (Float32 or Double)
         enum Num { case f(UnsafePointer<Float>), d(UnsafePointer<Double>) }
-        let px: Num = (X.dataType == .double)
-            ? .d(X.dataPointer.bindMemory(to: Double.self, capacity: X.count))
-            : .f(X.dataPointer.bindMemory(to: Float.self,  capacity: X.count))
-        let py: Num = (Y.dataType == .double)
-            ? .d(Y.dataPointer.bindMemory(to: Double.self, capacity: Y.count))
-            : .f(Y.dataPointer.bindMemory(to: Float.self,  capacity: Y.count))
+        let px: Num = (X.dataType == .double) ? .d(X.dataPointer.bindMemory(to: Double.self, capacity: X.count))
+                                              : .f(X.dataPointer.bindMemory(to: Float.self,  capacity: X.count))
+        let py: Num = (Y.dataType == .double) ? .d(Y.dataPointer.bindMemory(to: Double.self, capacity: Y.count))
+                                              : .f(Y.dataPointer.bindMemory(to: Float.self,  capacity: Y.count))
+        @inline(__always) func get(_ n: Num, _ i: Int) -> Float { switch n { case .f(let p): return p[i]; case .d(let p): return Float(p[i]) } }
 
-        @inline(__always) func read(_ n: Num, _ idx: Int) -> Float {
-            switch n { case .f(let p): return p[idx]; case .d(let p): return Float(p[idx]) }
+        func off(_ k: Int, _ i: Int, _ s: [Int], _ kIdx: Int, _ wIdx: Int) -> Int {
+            return k * s[kIdx] + i * s[wIdx]
         }
 
-        // Compute argmax indices once for a given (kIdx,wIdx) ordering
-        func decodeOnce(kIdxX: Int, wIdxX: Int, kIdxY: Int, wIdxY: Int) -> (ix: [Int], iy: [Int], score: [Float]) {
-            func off(_ k: Int, _ i: Int, _ strides: [Int], _ kIdx: Int, _ wIdx: Int) -> Int {
-                // batch is 0 so omitted; CoreML strides are in elements
-                return k * strides[kIdx] + i * strides[wIdx]
-            }
+        func decodeOnce(kx: Int, wx: Int, ky: Int, wy: Int) -> ([Int],[Int],[Float]) {
             var ix = Array(repeating: 0, count: K)
             var iy = Array(repeating: 0, count: K)
             var sc = Array(repeating: Float(0), count: K)
-
             for k in 0..<K {
                 var mxX: Float = -.greatestFiniteMagnitude, argX = 0
                 for i in 0..<WX {
-                    let v = read(px, off(k, i, sx, kIdxX, wIdxX))
-                    if v > mxX { mxX = v; argX = i }
+                    let v = get(px, off(k, i, sx, kx, wx)); if v > mxX { mxX = v; argX = i }
                 }
                 var mxY: Float = -.greatestFiniteMagnitude, argY = 0
                 for i in 0..<WY {
-                    let v = read(py, off(k, i, sy, kIdxY, wIdxY))
-                    if v > mxY { mxY = v; argY = i }
+                    let v = get(py, off(k, i, sy, ky, wy)); if v > mxY { mxY = v; argY = i }
                 }
-                ix[k] = argX; iy[k] = argY
-                sc[k] = (mxX + mxY) * 0.5
+                ix[k] = argX; iy[k] = argY; sc[k] = (mxX + mxY) * 0.5
             }
             return (ix, iy, sc)
         }
 
-        // Try A: as inferred, then B: swapped (K<->W)
-        let A = decodeOnce(kIdxX: aX.k, wIdxX: aX.w, kIdxY: aY.k, wIdxY: aY.w)
-        let B = decodeOnce(kIdxX: aX.w, wIdxX: aX.k, kIdxY: aY.w, wIdxY: aY.k)
+        let A = decodeOnce(kx: ax.k, wx: ax.w, ky: ay.k, wy: ay.w)
+        let B = decodeOnce(kx: ax.w, wx: ax.k, ky: ay.w, wy: ay.k)
 
-        // Pick the result with more distinct (x,y) indices (avoid “all joints at one point”)
         func diversity(_ xs: [Int], _ ys: [Int]) -> Int {
             var set = Set<Int>(); set.reserveCapacity(xs.count)
             for i in 0..<xs.count { set.insert((xs[i] << 16) ^ ys[i]) }
             return set.count
         }
-        let pickA = diversity(A.ix, A.iy) >= diversity(B.ix, B.iy)
-        let ix = pickA ? A.ix : B.ix
-        let iy = pickA ? A.iy : B.iy
-        let sc = pickA ? A.score : B.score
+        let useA = diversity(A.0, A.1) >= diversity(B.0, B.1)
+        let ix = useA ? A.0 : B.0
+        let iy = useA ? A.1 : B.1
+        let sc = useA ? A.2 : B.2
 
-        // Map back into video coordinates (account for rotation)
-        let rotation = normalizedRotationDegrees(rotationDegrees)
-        let swapAxes = rotation == 90 || rotation == 270
-        let cropWidth = Double(cropRect.width)
-        let cropHeight = Double(cropRect.height)
-        let rotatedWidth = swapAxes ? cropHeight : cropWidth
-        let rotatedHeight = swapAxes ? cropWidth : cropHeight
-        let scaleX = rotatedWidth  / Double(inputWidth)
-        let scaleY = rotatedHeight / Double(inputHeight)
+        // Map back to the full frame
+        let swapAxes = (rotation == 90 || rotation == 270)
+        let cropW = Double(cropRect.width), cropH = Double(cropRect.height)
+        let rotW = swapAxes ? cropH : cropW, rotH = swapAxes ? cropW : cropH
+        let scaleX = rotW / Double(RTMPOSE_INPUT_W)
+        let scaleY = rotH / Double(RTMPOSE_INPUT_H)
 
-        var out: [RTMPoseKeypoint] = []
-        out.reserveCapacity(K)
+        var out: [RTMPoseKeypoint] = []; out.reserveCapacity(K)
         for k in 0..<K {
-            let xIn = Double(ix[k]) / simccRatio
-            let yIn = Double(iy[k]) / simccRatio
-            let xr = xIn * scaleX
-            let yr = yIn * scaleY
-            let mapped = mapRotatedPoint(
-                x: xr,
-                y: yr,
-                rotation: rotation,
-                cropWidth: cropWidth,
-                cropHeight: cropHeight
-            )
-            let x = min(Double(videoWidth),  max(0, Double(cropRect.minX) + Double(mapped.x)))
-            let y = min(Double(videoHeight), max(0, Double(cropRect.minY) + Double(mapped.y)))
-            let s = max(0, min(1, Double(sc[k])))
-            out.append(RTMPoseKeypoint(x: x, y: y, score: s))
+            let xf = Double(ix[k]) / RTMPOSE_SIMCC_RATIO
+            let yf = Double(iy[k]) / RTMPOSE_SIMCC_RATIO
+            let xr = xf * scaleX
+            let yr = yf * scaleY
+            let p = rotatePoint(x: xr, y: yr, rotation: rotation, cropW: cropW, cropH: cropH)
+            let Xv = min(Double(videoW),  max(0, Double(cropRect.minX) + p.x))
+            let Yv = min(Double(videoH),  max(0, Double(cropRect.minY) + p.y))
+            let S  = max(0, min(1, Double(sc[k])))
+            out.append(RTMPoseKeypoint(x: Xv, y: Yv, score: S))
         }
         return out
     }
 
-    private func mapRotatedPoint(
-        x: Double,
-        y: Double,
-        rotation: Int,
-        cropWidth: Double,
-        cropHeight: Double
-    ) -> CGPoint {
-        let rotation = normalizedRotationDegrees(rotation)
-        if rotation == 0 {
-            return CGPoint(x: x, y: y)
-        }
+    private func rotatePoint(x: Double, y: Double, rotation: Int, cropW: Double, cropH: Double) -> CGPoint {
+        let rot = normalizedRotation(rotation)
+        if rot == 0 { return CGPoint(x: x, y: y) }
 
-        let swapAxes = rotation == 90 || rotation == 270
-        let rotatedWidth = swapAxes ? cropHeight : cropWidth
-        let rotatedHeight = swapAxes ? cropWidth : cropHeight
+        let swap = (rot == 90 || rot == 270)
+        let rotW = swap ? cropH : cropW
+        let rotH = swap ? cropW : cropH
+        let cx = cropW/2, cy = cropH/2
+        let cxr = rotW/2, cyr = rotH/2
 
-        let cx = cropWidth / 2.0
-        let cy = cropHeight / 2.0
-        let cxRot = rotatedWidth / 2.0
-        let cyRot = rotatedHeight / 2.0
+        let txp = x - cxr
+        let typ = y - cyr
 
-        let txp = x - cxRot
-        let typ = y - cyRot
-
-        let theta = Double(rotation) * Double.pi / 180.0
-        let cosT = cos(theta)
-        let sinT = sin(theta)
-
-        let tx = txp * cosT - typ * sinT
-        let ty = txp * sinT + typ * cosT
-
+        let th = Double(rot) * Double.pi / 180.0
+        let c = cos(th), s = sin(th)
+        let tx = txp * c - typ * s
+        let ty = txp * s + typ * c
         return CGPoint(x: tx + cx, y: ty + cy)
     }
 
-    private func rotate(image: CGImage, clockwiseDegrees degrees: Int) -> CGImage? {
-        let rotation = normalizedRotationDegrees(degrees)
-        guard rotation != 0 else { return image }
+    private func rotate(image: CGImage, clockwiseDegrees deg: Int) -> CGImage? {
+        let rot = normalizedRotation(deg)
+        guard rot != 0 else { return image }
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        let swap = (rot == 90 || rot == 270)
+        let size = swap ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
 
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
-        let swapAxes = rotation == 90 || rotation == 270
-        let size = swapAxes ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
-
-        let format = UIGraphicsImageRendererFormat.default()
-        format.scale = 1
-        let renderer = UIGraphicsImageRenderer(size: size, format: format)
-        let rotated = renderer.image { ctx in
-            let cg = ctx.cgContext
-            cg.translateBy(x: size.width / 2.0, y: size.height / 2.0)
-            let radians = CGFloat(Double(rotation) * Double.pi / 180.0)
-            cg.rotate(by: radians)
-            cg.translateBy(x: -width / 2.0, y: -height / 2.0)
-            cg.interpolationQuality = .high
-            cg.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = 1
+        let renderer = UIGraphicsImageRenderer(size: size, format: fmt)
+        let img = renderer.image { ctx in
+            let g = ctx.cgContext
+            g.translateBy(x: size.width/2, y: size.height/2)
+            g.rotate(by: CGFloat(Double(rot) * Double.pi / 180.0))
+            g.translateBy(x: -w/2, y: -h/2)
+            g.interpolationQuality = .high
+            g.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         }
-        return rotated.cgImage
+        return img.cgImage
     }
 
-    private func normalizedRotationDegrees(_ degrees: Int) -> Int {
-        let normalized = ((degrees % 360) + 360) % 360
-        switch normalized {
-        case 90, 180, 270:
-            return normalized
-        default:
-            return 0
-        }
+    private func normalizedRotation(_ deg: Int) -> Int {
+        let n = ((deg % 360) + 360) % 360
+        return (n == 90 || n == 180 || n == 270) ? n : 0
     }
 
-    private func extractFloats(from multiArray: MLMultiArray) -> [Float]? {
-        let count = multiArray.count
-        switch multiArray.dataType {
-        case .float32:
-            let p = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
-            return Array(UnsafeBufferPointer(start: p, count: count))
-        case .double:
-            let p = multiArray.dataPointer.bindMemory(to: Double.self, capacity: count)
-            return (0..<count).map { Float(p[$0]) }
-        default:
-            return nil
-        }
-    }
-
-    private func renderPreview(
-        baseImage: CGImage,
-        keypoints: [RTMPoseKeypoint],
-        outputURL: URL
-    ) throws -> URL {
-        let width = baseImage.width, height = baseImage.height
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
-        let image = renderer.image { ctx in
-            let cg = ctx.cgContext
-            cg.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-            cg.setLineWidth(4); cg.setLineCap(.round)
-            cg.setStrokeColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
-            cg.setFillColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
-            for (aIdx, bIdx) in skeletonPairs where aIdx < keypoints.count && bIdx < keypoints.count {
-                let a = keypoints[aIdx], b = keypoints[bIdx]
-                if a.score <= 0 || b.score <= 0 { continue }
-                cg.move(to: CGPoint(x: a.x, y: a.y)); cg.addLine(to: CGPoint(x: b.x, y: b.y)); cg.strokePath()
-            }
-            let r: CGFloat = 6
-            for kp in keypoints where kp.score > 0 {
-                cg.fillEllipse(in: CGRect(x: kp.x - r/2, y: kp.y - r/2, width: r, height: r))
-            }
-        }
-        guard let jpeg = image.jpegData(compressionQuality: 0.85) else { throw RTMPoseError.failedToCreatePreview }
-        try jpeg.write(to: outputURL, options: .atomic)
-        return outputURL
-    }
-
-    private func paddedBoundingBox(
-        for box: YOLODetectionBox,
-        videoWidth: Int,
-        videoHeight: Int,
-        paddingFactor: Double
-    ) -> CGRect {
+    private func paddedRect(for box: YOLODetectionBox, videoW: Int, videoH: Int, pad: Double) -> CGRect {
         let cx = Double(box.x) + Double(box.w) / 2.0
         let cy = Double(box.y) + Double(box.h) / 2.0
-        let pw = Double(box.w) * paddingFactor
-        let ph = Double(box.h) * paddingFactor
+        let pw = Double(box.w) * pad
+        let ph = Double(box.h) * pad
         var minX = cx - pw/2, minY = cy - ph/2
         var maxX = cx + pw/2, maxY = cy + ph/2
         minX = max(0, minX); minY = max(0, minY)
-        maxX = min(Double(videoWidth), maxX); maxY = min(Double(videoHeight), maxY)
+        maxX = min(Double(videoW), maxX); maxY = min(Double(videoH), maxY)
         return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
+    }
+
+    private func renderPreview(baseImage: CGImage, keypoints: [RTMPoseKeypoint], outputURL: URL) throws -> URL {
+        let w = baseImage.width, h = baseImage.height
+        let img = UIGraphicsImageRenderer(size: CGSize(width: w, height: h)).image { ctx in
+            let g = ctx.cgContext
+            g.draw(baseImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            g.setLineWidth(4); g.setLineCap(.round)
+            g.setStrokeColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+            g.setFillColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+            for (a,b) in skeletonPairs where a < keypoints.count && b < keypoints.count {
+                let A = keypoints[a], B = keypoints[b]
+                if A.score <= 0 || B.score <= 0 { continue }
+                g.move(to: CGPoint(x: A.x, y: A.y)); g.addLine(to: CGPoint(x: B.x, y: B.y)); g.strokePath()
+            }
+            let r: CGFloat = 6
+            for kp in keypoints where kp.score > 0 {
+                g.fillEllipse(in: CGRect(x: kp.x - r/2, y: kp.y - r/2, width: r, height: r))
+            }
+        }
+        guard let jpeg = img.jpegData(compressionQuality: 0.85) else { throw RTMPoseError.failedToCreatePreview }
+        try jpeg.write(to: outputURL, options: .atomic)
+        return outputURL
     }
 }
 
-enum VideoAnalysisStage: String {
-    case yolo
-    case rtmpose
-}
+// =====================================================
+// MARK: – Pipeline wrapper
+// =====================================================
+
+enum VideoAnalysisStage: String { case yolo, rtmpose }
 
 struct VideoAnalysisStageError: Error, LocalizedError {
     let stage: VideoAnalysisStage
     let underlying: Error
-
     var errorDescription: String? {
-        if let localized = (underlying as NSError?)?.localizedDescription, !localized.isEmpty {
-            return localized
-        }
+        if let s = (underlying as NSError?)?.localizedDescription, !s.isEmpty { return s }
         return String(describing: underlying)
     }
 }
@@ -959,36 +880,27 @@ final class VideoAnalysisPipeline {
             do {
                 progress?("Running YOLO…")
                 let yoloSummary: YOLOAnalysisSummary = try autoreleasepool {
-                    let analyzer = VideoYOLOAnalyzer(personStrategy: personStrategy)
-                    defer { analyzer.teardown() }
-                    return try analyzer.analyze(
-                        videoAtPath: videoPath,
-                        sessionDirectory: sessionDirectory,
-                        sampledFps: sampledFps
-                    )
+                    let a = VideoYOLOAnalyzer(personStrategy: personStrategy)
+                    defer { a.teardown() }
+                    return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, sampledFps: sampledFps)
                 }
-                NSLog("YOLO stage complete. Frames: %d, detections: %d", yoloSummary.totals.framesProcessed, yoloSummary.totals.detections)
+                NSLog("YOLO stage complete. frames=%d detections=%d", yoloSummary.totals.framesProcessed, yoloSummary.totals.detections)
 
                 progress?("Running RTMPose…")
                 let poseSummary: RTMPoseSummary = try autoreleasepool {
-                    let analyzer = RTMPoseAnalyzer(personStrategy: personStrategy)
-                    defer { analyzer.teardown() }
-                    return try analyzer.analyze(
-                        videoAtPath: videoPath,
-                        sessionDirectory: sessionDirectory,
-                        yoloJSONURL: yoloSummary.jsonURL
-                    )
+                    let a = RTMPoseAnalyzer(personStrategy: personStrategy)
+                    defer { a.teardown() }
+                    return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, yoloJSONURL: yoloSummary.jsonURL)
                 }
-                NSLog("RTMPose stage complete. Frames: %d, detections: %d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
+                NSLog("RTMPose stage complete. frames=%d ok=%d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
 
-                let result = VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary)
-                completion(.success(result))
-            } catch let stageError as VideoAnalysisStageError {
-                completion(.failure(stageError))
-            } catch let error as YOLOAnalysisError {
-                completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
-            } catch let error as RTMPoseError {
-                completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: error)))
+                completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary)))
+            } catch let e as VideoAnalysisStageError {
+                completion(.failure(e))
+            } catch let e as YOLOAnalysisError {
+                completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: e)))
+            } catch let e as RTMPoseError {
+                completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: e)))
             } catch {
                 completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
             }
