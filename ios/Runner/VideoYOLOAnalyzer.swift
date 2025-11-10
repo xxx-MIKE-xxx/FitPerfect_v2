@@ -404,7 +404,6 @@ final class RTMPoseAnalyzer {
             }
         }
 
-
         let totals = RTMPoseTotals(
             framesProcessed: frames.count,
             framesWithDetections: framesWithDetections
@@ -469,6 +468,7 @@ final class RTMPoseAnalyzer {
             width: paddedRect.width, height: paddedRect.height
         )
 
+        // CoreGraphics uses origin at top-left; convert to CGImage coords (origin at top-left for CGImage)
         let cgCropRect = CGRect(
             x: cropRect.minX,
             y: Double(imageHeight) - cropRect.minY - cropRect.height,
@@ -481,12 +481,20 @@ final class RTMPoseAnalyzer {
         var pixels = [UInt8](repeating: 0, count: inputWidth * inputHeight * 4)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = inputWidth * 4
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+        // Force RGBA layout so channel reads are predictable
+        let bitmapInfo: CGBitmapInfo = [
+            CGBitmapInfo.byteOrder32Big,
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        ]
 
         guard let context = CGContext(
-            data: &pixels, width: inputWidth, height: inputHeight,
-            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
-            space: colorSpace, bitmapInfo: bitmapInfo
+            data: &pixels,
+            width: inputWidth,
+            height: inputHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
         ) else { return nil }
 
         context.interpolationQuality = .high
@@ -496,12 +504,14 @@ final class RTMPoseAnalyzer {
         var floatData = [Float](repeating: 0, count: pixelCount * 3)
         for idx in 0..<pixelCount {
             let base = idx * 4
+            // RGBA (byteOrder32Big + premultipliedLast)
             let r = Float(pixels[base + 0])
             let g = Float(pixels[base + 1])
             let b = Float(pixels[base + 2])
-            floatData[idx] = (r - channelMeans[0]) / channelStds[0]
+
+            floatData[idx]              = (r - channelMeans[0]) / channelStds[0]
             floatData[pixelCount + idx] = (g - channelMeans[1]) / channelStds[1]
-            floatData[(2 * pixelCount) + idx] = (b - channelMeans[2]) / channelStds[2]
+            floatData[2 * pixelCount + idx] = (b - channelMeans[2]) / channelStds[2]
         }
 
         let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
@@ -528,69 +538,103 @@ final class RTMPoseAnalyzer {
         videoHeight: Int
     ) -> [RTMPoseKeypoint] {
 
-        let simccX = prediction.simcc_x
-        let simccY = prediction.simcc_y
+        // Pull shapes/strides
+        let X = prediction.simcc_x
+        let Y = prediction.simcc_y
+        let dx = X.shape.map { Int(truncating: $0) }   // e.g. [1,17,384] or [1,384,17]
+        let dy = Y.shape.map { Int(truncating: $0) }   // e.g. [1,17,512] or [1,512,17]
+        let sx = X.strides.map { Int(truncating: $0) } // strides are in ELEMENTS
+        let sy = Y.strides.map { Int(truncating: $0) }
 
-        // Shapes & strides
-        let dx = simccX.shape.map { Int(truncating: $0) }   // e.g. [1,17,384] or [1,384,17]
-        let dy = simccY.shape.map { Int(truncating: $0) }
-        let sx = simccX.strides.map { Int(truncating: $0) } // e.g. [17*384, 384, 1] if [B,K,W]
-        let sy = simccY.strides.map { Int(truncating: $0) }
-
-        // Find which dim is Keypoints (K) and which is the SIMCC length (W)
-        func dims(_ d: [Int]) -> (kIdx: Int, wIdx: Int, K: Int, W: Int) {
-            // Prefer a known K (17/26/29); otherwise pick the smaller of the last two dims.
+        // Helper to pick which dim is K (17/26/29) and which is W
+        func dims(_ d: [Int]) -> (k: Int, w: Int, K: Int, W: Int) {
             let candidates: Set<Int> = [17, 26, 29]
-            let kIdx = (d.indices.first { candidates.contains(d[$0]) } ?? ((d[1] < d[2]) ? 1 : 2))
-            let wIdx = (kIdx == 1) ? 2 : 1
-            return (kIdx, wIdx, d[kIdx], d[wIdx])
+            if let ki = d.indices.first(where: { candidates.contains(d[$0]) }) {
+                let wi = (ki == 1) ? 2 : 1
+                return (ki, wi, d[ki], d[wi])
+            }
+            // fallback: pick the smaller of the last two dims as K
+            let ki = (d[1] < d[2]) ? 1 : 2
+            let wi = (ki == 1) ? 2 : 1
+            return (ki, wi, d[ki], d[wi])
         }
 
-        let (kIdxX, wIdxX, Kx, Wx) = dims(dx)
-        let (kIdxY, wIdxY, Ky, Wy) = dims(dy)
-        let K = min(Kx, Ky)            // safety if they differ slightly
-        let WX = Wx, WY = Wy
+        let aX = dims(dx), aY = dims(dy)
+        let K  = min(aX.K, aY.K)
+        let WX = aX.W
+        let WY = aY.W
 
-        // Raw pointers
-        let px = simccX.dataPointer.bindMemory(to: Float.self, capacity: simccX.count)
-        let py = simccY.dataPointer.bindMemory(to: Float.self, capacity: simccY.count)
+        // Type-safe raw readers (Float32 or Double)
+        enum Num { case f(UnsafePointer<Float>), d(UnsafePointer<Double>) }
+        let px: Num = (X.dataType == .double)
+            ? .d(X.dataPointer.bindMemory(to: Double.self, capacity: X.count))
+            : .f(X.dataPointer.bindMemory(to: Float.self,  capacity: X.count))
+        let py: Num = (Y.dataType == .double)
+            ? .d(Y.dataPointer.bindMemory(to: Double.self, capacity: Y.count))
+            : .f(Y.dataPointer.bindMemory(to: Float.self,  capacity: Y.count))
 
-        // Stride helpers to compute flat offsets
-        func offX(_ k: Int, _ i: Int) -> Int { k * sx[kIdxX] + i * sx[wIdxX] }
-        func offY(_ k: Int, _ i: Int) -> Int { k * sy[kIdxY] + i * sy[wIdxY] }
+        @inline(__always) func read(_ n: Num, _ idx: Int) -> Float {
+            switch n { case .f(let p): return p[idx]; case .d(let p): return Float(p[idx]) }
+        }
 
-        var keypoints: [RTMPoseKeypoint] = []
-        keypoints.reserveCapacity(K)
+        // Compute argmax indices once for a given (kIdx,wIdx) ordering
+        func decodeOnce(kIdxX: Int, wIdxX: Int, kIdxY: Int, wIdxY: Int) -> (ix: [Int], iy: [Int], score: [Float]) {
+            func off(_ k: Int, _ i: Int, _ strides: [Int], _ kIdx: Int, _ wIdx: Int) -> Int {
+                // batch is 0 so omitted; CoreML strides are in elements
+                return k * strides[kIdx] + i * strides[wIdx]
+            }
+            var ix = Array(repeating: 0, count: K)
+            var iy = Array(repeating: 0, count: K)
+            var sc = Array(repeating: Float(0), count: K)
 
+            for k in 0..<K {
+                var mxX: Float = -.greatestFiniteMagnitude, argX = 0
+                for i in 0..<WX {
+                    let v = read(px, off(k, i, sx, kIdxX, wIdxX))
+                    if v > mxX { mxX = v; argX = i }
+                }
+                var mxY: Float = -.greatestFiniteMagnitude, argY = 0
+                for i in 0..<WY {
+                    let v = read(py, off(k, i, sy, kIdxY, wIdxY))
+                    if v > mxY { mxY = v; argY = i }
+                }
+                ix[k] = argX; iy[k] = argY
+                sc[k] = (mxX + mxY) * 0.5
+            }
+            return (ix, iy, sc)
+        }
+
+        // Try A: as inferred, then B: swapped (K<->W)
+        let A = decodeOnce(kIdxX: aX.k, wIdxX: aX.w, kIdxY: aY.k, wIdxY: aY.w)
+        let B = decodeOnce(kIdxX: aX.w, wIdxX: aX.k, kIdxY: aY.w, wIdxY: aY.k)
+
+        // Pick the result with more distinct (x,y) indices (avoid “all joints at one point”)
+        func diversity(_ xs: [Int], _ ys: [Int]) -> Int {
+            var set = Set<Int>(); set.reserveCapacity(xs.count)
+            for i in 0..<xs.count { set.insert((xs[i] << 16) ^ ys[i]) }
+            return set.count
+        }
+        let pickA = diversity(A.ix, A.iy) >= diversity(B.ix, B.iy)
+        let ix = pickA ? A.ix : B.ix
+        let iy = pickA ? A.iy : B.iy
+        let sc = pickA ? A.score : B.score
+
+        // Map back into video coordinates
         let scaleX = cropRect.width  / Double(inputWidth)
         let scaleY = cropRect.height / Double(inputHeight)
 
+        var out: [RTMPoseKeypoint] = []
+        out.reserveCapacity(K)
         for k in 0..<K {
-            var maxX: Float = -Float.greatestFiniteMagnitude, idxX = 0
-            for i in 0..<WX {
-                let v = px[offX(k, i)]
-                if v > maxX { maxX = v; idxX = i }
-            }
-
-            var maxY: Float = -Float.greatestFiniteMagnitude, idxY = 0
-            for i in 0..<WY {
-                let v = py[offY(k, i)]
-                if v > maxY { maxY = v; idxY = i }
-            }
-
-            let xIn = Double(idxX) / simccRatio
-            let yIn = Double(idxY) / simccRatio
-
-            let mappedX = min(Double(videoWidth),  max(0, cropRect.minX + xIn * scaleX))
-            let mappedY = min(Double(videoHeight), max(0, cropRect.minY + yIn * scaleY))
-
-            let score = max(0, min(1, Double((maxX + maxY) / 2.0)))
-            keypoints.append(RTMPoseKeypoint(x: mappedX, y: mappedY, score: score))
+            let xIn = Double(ix[k]) / simccRatio
+            let yIn = Double(iy[k]) / simccRatio
+            let x = min(Double(videoWidth),  max(0, cropRect.minX + xIn * scaleX))
+            let y = min(Double(videoHeight), max(0, cropRect.minY + yIn * scaleY))
+            let s = max(0, min(1, Double(sc[k])))
+            out.append(RTMPoseKeypoint(x: x, y: y, score: s))
         }
-
-        return keypoints
+        return out
     }
-
 
     private func extractFloats(from multiArray: MLMultiArray) -> [Float]? {
         let count = multiArray.count
@@ -651,7 +695,6 @@ final class RTMPoseAnalyzer {
         return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
     }
 }
-
 
 enum VideoAnalysisStage: String {
     case yolo

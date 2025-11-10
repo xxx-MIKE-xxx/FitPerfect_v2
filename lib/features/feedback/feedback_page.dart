@@ -6,7 +6,7 @@ import 'package:go_router/go_router.dart';
 import 'package:path/path.dart' as p;
 import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
-
+import 'dart:typed_data';
 import '../../models/feedback_session.dart';
 import '../../rtmpose/rtmpose_overlay.dart';
 import '../../rtmpose/rtmpose_result.dart';
@@ -369,7 +369,8 @@ Future<String> zipRun(FeedbackSession session) async {
 
   Future<void> addDirectory(Directory directory, String relativePath) async {
     if (relativePath.isNotEmpty) {
-      archive.addFile(ArchiveFile.directory(relativePath));
+      final dirPath = relativePath.endsWith('/') ? relativePath : '$relativePath/';
+      archive.addFile(ArchiveFile(dirPath, 0, Uint8List(0))); // directory entry
     }
 
     await for (final entity
