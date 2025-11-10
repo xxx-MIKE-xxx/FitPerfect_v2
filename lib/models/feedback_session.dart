@@ -17,15 +17,21 @@ class FeedbackMetric {
 class FeedbackSession {
   final Exercise exercise;
   final String videoPath;
+  final String sessionDir;
   final List<FeedbackMetric> metrics;
   final String summary;
   final String? poseJsonPath;
+  final String? yoloJsonPath;
+  final String? posePreviewPath;
 
   const FeedbackSession({
     required this.exercise,
     required this.videoPath,
+    required this.sessionDir,
     required this.metrics,
     required this.summary,
     this.poseJsonPath,
+    this.yoloJsonPath,
+    this.posePreviewPath,
   });
 }

@@ -350,15 +350,20 @@ class _CameraPageState extends State<CameraPage> {
         FeedbackMetric(label: 'Pose Preview', value: _posePreviewPath!.split('/').last),
     ];
 
+    final sessionDirPath = _sessionDir?.path ?? File(videoPath).parent.path;
+
     final session = FeedbackSession(
       exercise: widget.exercise,
       videoPath: videoPath,
+      sessionDir: sessionDirPath,
       metrics: metrics,
       summary: _poseFramesWithDetections > 0
           ? 'YOLO detected $_detections objects across $_framesAnalyzed frames. '
               'RTMPose produced keypoints for $_poseFramesWithDetections of $_poseFramesProcessed frames.'
           : 'No pose keypoints were detected in the sampled frames.',
       poseJsonPath: _poseJsonPath,
+      yoloJsonPath: _yoloJsonPath,
+      posePreviewPath: _posePreviewPath,
     );
 
     context.push('/feedback', extra: session);

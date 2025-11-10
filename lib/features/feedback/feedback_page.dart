@@ -1,7 +1,10 @@
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:path/path.dart' as p;
+import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../models/feedback_session.dart';
@@ -25,6 +28,7 @@ class _FeedbackPageState extends State<FeedbackPage> {
   YoloResult? _yolo;
   RtmposeResult? _rtmpose;
   bool _showPose = true;
+  bool _isSharing = false;
 
   @override
   void initState() {
@@ -35,17 +39,19 @@ class _FeedbackPageState extends State<FeedbackPage> {
         ..setLooping(true)
         ..setVolume(1.0);
 
-      final videoFile = File(widget.session.videoPath);
-      final jsonPath = '${videoFile.parent.path}/yolo_detections.json';
+      final session = widget.session;
+      final sessionDir = Directory(session.sessionDir);
+      final jsonPath = session.yoloJsonPath ??
+          p.join(sessionDir.path, 'yolo_detections.json');
       final result = await YoloResult.load(jsonPath);
 
-      final poseJsonPath = widget.session.poseJsonPath;
+      final poseJsonPath = session.poseJsonPath;
       RtmposeResult? poseResult;
       if (poseJsonPath != null) {
         poseResult = await RtmposeResult.load(poseJsonPath);
       }
 
-      final fallbackPosePath = '${videoFile.parent.path}/rtmpose_keypoints.json';
+      final fallbackPosePath = p.join(sessionDir.path, 'rtmpose_keypoints.json');
       if (poseResult == null && fallbackPosePath != poseJsonPath) {
         poseResult = await RtmposeResult.load(fallbackPosePath);
       }
@@ -80,12 +86,64 @@ class _FeedbackPageState extends State<FeedbackPage> {
     setState(() {});
   }
 
+  Future<void> _shareRun() async {
+    if (_isSharing) {
+      return;
+    }
+
+    setState(() {
+      _isSharing = true;
+    });
+
+    try {
+      final zipPath = await zipRun(widget.session);
+      await Share.shareXFiles(
+        [XFile(zipPath)],
+        text: 'FitPerfect run export',
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.showSnackBar(
+        SnackBar(content: Text('Unable to share run: $error')),
+      );
+    } finally {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isSharing = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final session = widget.session;
 
     return Scaffold(
-      appBar: AppBar(title: Text('${session.exercise.name} Feedback')),
+      appBar: AppBar(
+        title: Text('${session.exercise.name} Feedback'),
+        actions: [
+          if (_isSharing)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                height: 20,
+                width: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+          else
+            IconButton(
+              icon: const Icon(Icons.ios_share),
+              tooltip: 'Share Run',
+              onPressed: _shareRun,
+            ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -295,4 +353,103 @@ class _FeedbackPageState extends State<FeedbackPage> {
       ),
     );
   }
+}
+
+Future<String> zipRun(FeedbackSession session) async {
+  final sessionDir = Directory(session.sessionDir);
+  if (!await sessionDir.exists()) {
+    throw StateError('Session directory not found: ${session.sessionDir}');
+  }
+
+  final archive = Archive();
+  final seen = <String>{};
+  final rootName = p.basename(sessionDir.path).isEmpty
+      ? 'session'
+      : p.basename(sessionDir.path);
+
+  Future<void> addDirectory(Directory directory, String relativePath) async {
+    if (relativePath.isNotEmpty) {
+      archive.addFile(ArchiveFile.directory(relativePath));
+    }
+
+    await for (final entity
+        in directory.list(recursive: false, followLinks: false)) {
+      final name = p.basename(entity.path);
+      final relativeEntry =
+          relativePath.isEmpty ? name : p.posix.join(relativePath, name);
+
+      if (entity is File) {
+        final normalized = p.normalize(entity.path);
+        if (!seen.add(normalized)) {
+          continue;
+        }
+
+        final bytes = await entity.readAsBytes();
+        archive.addFile(ArchiveFile(relativeEntry, bytes.length, bytes));
+      } else if (entity is Directory) {
+        await addDirectory(entity, relativeEntry);
+      }
+    }
+  }
+
+  await addDirectory(sessionDir, rootName);
+
+  final additionalPaths = <String?>{
+    session.videoPath,
+    session.yoloJsonPath,
+    session.poseJsonPath,
+    session.posePreviewPath,
+  }..removeWhere((path) => path == null || path!.isEmpty);
+
+  for (final path in additionalPaths.cast<String>()) {
+    final file = File(path);
+    if (!await file.exists()) {
+      continue;
+    }
+
+    final normalized = p.normalize(file.path);
+    if (seen.contains(normalized)) {
+      continue;
+    }
+
+    if (p.isWithin(sessionDir.path, file.path)) {
+      continue;
+    }
+
+    final bytes = await file.readAsBytes();
+    final baseName = p.basename(file.path);
+    String entryName = p.posix.join('external', baseName);
+    if (archive.files.any((entry) => entry.name == entryName)) {
+      final nameWithoutExtension = p.basenameWithoutExtension(baseName);
+      final extension = p.extension(baseName);
+      var counter = 1;
+      while (archive.files.any((entry) => entry.name == entryName)) {
+        final numberedName = '${nameWithoutExtension}_$counter$extension';
+        entryName = p.posix.join('external', numberedName);
+        counter++;
+      }
+    }
+
+    archive.addFile(ArchiveFile(entryName, bytes.length, bytes));
+    seen.add(normalized);
+  }
+
+  final encoder = ZipEncoder();
+  final data = encoder.encode(archive);
+  if (data == null) {
+    throw StateError('Failed to encode archive');
+  }
+
+  final timestamp = DateTime.now().millisecondsSinceEpoch;
+  final zipName = 'fitperfect_run_$timestamp.zip';
+  final outputDir = sessionDir.parent;
+  final outputPath = p.join(outputDir.path, zipName);
+  final outputFile = File(outputPath);
+
+  if (await outputFile.exists()) {
+    await outputFile.delete();
+  }
+
+  await outputFile.writeAsBytes(data, flush: true);
+  return outputPath;
 }
