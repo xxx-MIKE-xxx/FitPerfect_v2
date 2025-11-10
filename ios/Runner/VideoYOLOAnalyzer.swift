@@ -264,7 +264,7 @@ struct RTMPoseTotals: Codable {
     let framesWithDetections: Int
 }
 
-struct RTMPoseOutput: Codable {
+struct RTMPoseJSONOutput: Codable {
     struct InputSize: Codable {
         let w: Int
         let h: Int
@@ -288,11 +288,13 @@ struct RTMPoseSummary {
     let numKeypoints: Int
 }
 
+// === Replace the whole RTMPoseAnalyzer with this version ===
 final class RTMPoseAnalyzer {
     private let paddingFactor: Double
     private let personStrategy: PersonSelectionStrategy
 
-    private var model: MLModel?
+    // Use the auto-generated wrapper, not a raw MLModel
+    private var model: RTMPose?
     private var asset: AVAsset?
     private var generator: AVAssetImageGenerator?
 
@@ -317,30 +319,19 @@ final class RTMPoseAnalyzer {
         sessionDirectory: String,
         yoloJSONURL: URL
     ) throws -> RTMPoseSummary {
-        let jsonData: Data
-        do {
-            jsonData = try Data(contentsOf: yoloJSONURL)
-        } catch {
-            throw RTMPoseError.failedToLoadYOLO
-        }
-        let decoder = JSONDecoder()
-        let yoloOutput: YOLODetectionOutput
-        do {
-            yoloOutput = try decoder.decode(YOLODetectionOutput.self, from: jsonData)
-        } catch {
-            throw RTMPoseError.failedToLoadYOLO
-        }
+        // Load YOLO JSON as before
+        let jsonData = try Data(contentsOf: yoloJSONURL)
+        let yoloOutput = try JSONDecoder().decode(YOLODetectionOutput.self, from: jsonData)
 
+        // Video + model setup
         let videoURL = URL(fileURLWithPath: videoPath)
         let asset = AVAsset(url: videoURL)
         self.asset = asset
 
         let configuration = MLModelConfiguration()
-        configuration.computeUnits = .all
-        guard let modelURL = Bundle.main.url(forResource: "RTMPose", withExtension: "mlmodelc") else {
-            throw RTMPoseError.modelUnavailable
-        }
-        model = try MLModel(contentsOf: modelURL, configuration: configuration)
+        configuration.computeUnits = .cpuAndGPU   // more compatible than .all for this model
+        // Use generated wrapper
+        self.model = try RTMPose(configuration: configuration)
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -363,15 +354,13 @@ final class RTMPoseAnalyzer {
         for frame in yoloOutput.frames {
             autoreleasepool {
                 guard let selectedBox = self.selectPersonBox(from: frame.boxes) else {
-                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
-                    frames.append(empty)
+                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
                     return
                 }
 
                 let time = CMTime(seconds: frame.t, preferredTimescale: timeScale)
                 guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
-                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
-                    frames.append(empty)
+                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
                     return
                 }
 
@@ -384,39 +373,35 @@ final class RTMPoseAnalyzer {
                     ),
                     let prediction = try? self.predictPose(from: prepared.array)
                 else {
-                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
-                    frames.append(empty)
+                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
                     return
                 }
 
-                let decoded = self.decode(
+                let keypoints = self.decode(
                     prediction: prediction,
                     cropRect: prepared.cropRect,
                     videoWidth: yoloOutput.videoWidth,
                     videoHeight: yoloOutput.videoHeight
                 )
 
-                guard !decoded.keypoints.isEmpty else {
-                    let empty = RTMPoseFrame(t: frame.t, ok: false, keypoints: [])
-                    frames.append(empty)
+                guard !keypoints.isEmpty else {
+                    frames.append(RTMPoseFrame(t: frame.t, ok: false, keypoints: []))
                     return
                 }
 
                 if numKeypointsDetected == 0 {
-                    numKeypointsDetected = decoded.keypoints.count
+                    numKeypointsDetected = keypoints.count   // <-- fix
                 }
 
-                frames.append(RTMPoseFrame(t: frame.t, ok: true, keypoints: decoded.keypoints))
+                frames.append(RTMPoseFrame(t: frame.t, ok: true, keypoints: keypoints))
                 framesWithDetections += 1
 
-                if previewURL == nil {
-                    if let generatedPreview = try? self.renderPreview(
-                        baseImage: cgImage,
-                        keypoints: decoded.keypoints,
-                        outputURL: previewOutputURL
-                    ) {
-                        previewURL = generatedPreview
-                    }
+                if previewURL == nil, let p = try? self.renderPreview(
+                    baseImage: cgImage,
+                    keypoints: keypoints,
+                    outputURL: previewOutputURL
+                ) {
+                    previewURL = p
                 }
             }
         }
@@ -426,7 +411,7 @@ final class RTMPoseAnalyzer {
             framesWithDetections: framesWithDetections
         )
 
-        let output = RTMPoseOutput(
+        let output = RTMPoseJSONOutput(
             videoWidth: yoloOutput.videoWidth,
             videoHeight: yoloOutput.videoHeight,
             fps: yoloOutput.fps,
@@ -440,12 +425,8 @@ final class RTMPoseAnalyzer {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        do {
-            let data = try encoder.encode(output)
-            try data.write(to: poseJSONURL, options: .atomic)
-        } catch {
-            throw RTMPoseError.failedToWriteJSON
-        }
+        let data = try encoder.encode(output)
+        try data.write(to: poseJSONURL, options: .atomic)
 
         return RTMPoseSummary(
             jsonURL: poseJSONURL,
@@ -465,10 +446,8 @@ final class RTMPoseAnalyzer {
         let personBoxes = boxes.filter { $0.label == "person" }
         guard !personBoxes.isEmpty else { return nil }
         switch personStrategy {
-        case .bestScore:
-            return personBoxes.max(by: { $0.score < $1.score })
-        case .largest:
-            return personBoxes.max(by: { ($0.w * $0.h) < ($1.w * $1.h) })
+        case .bestScore: return personBoxes.max(by: { $0.score < $1.score })
+        case .largest:   return personBoxes.max(by: { ($0.w * $0.h) < ($1.w * $1.h) })
         }
     }
 
@@ -487,10 +466,8 @@ final class RTMPoseAnalyzer {
 
         let imageHeight = image.height
         let cropRect = CGRect(
-            x: paddedRect.minX,
-            y: paddedRect.minY,
-            width: paddedRect.width,
-            height: paddedRect.height
+            x: paddedRect.minX, y: paddedRect.minY,
+            width: paddedRect.width, height: paddedRect.height
         )
 
         let cgCropRect = CGRect(
@@ -500,9 +477,7 @@ final class RTMPoseAnalyzer {
             height: cropRect.height
         )
 
-        guard let cropped = image.cropping(to: cgCropRect.integral) else {
-            return nil
-        }
+        guard let cropped = image.cropping(to: cgCropRect.integral) else { return nil }
 
         var pixels = [UInt8](repeating: 0, count: inputWidth * inputHeight * 4)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -510,16 +485,11 @@ final class RTMPoseAnalyzer {
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
 
         guard let context = CGContext(
-            data: &pixels,
-            width: inputWidth,
-            height: inputHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        ) else {
-            return nil
-        }
+            data: &pixels, width: inputWidth, height: inputHeight,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+            space: colorSpace, bitmapInfo: bitmapInfo
+        ) else { return nil }
+
         context.interpolationQuality = .high
         context.draw(cropped, in: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight))
 
@@ -530,61 +500,45 @@ final class RTMPoseAnalyzer {
             let r = Float(pixels[base + 0])
             let g = Float(pixels[base + 1])
             let b = Float(pixels[base + 2])
-
             floatData[idx] = (r - channelMeans[0]) / channelStds[0]
             floatData[pixelCount + idx] = (g - channelMeans[1]) / channelStds[1]
             floatData[(2 * pixelCount) + idx] = (b - channelMeans[2]) / channelStds[2]
         }
 
         let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
-        guard let array = try? MLMultiArray(
-            shape: shape,
-            dataType: .float32
-        ) else {
-            return nil
-        }
-
-        floatData.withUnsafeBytes { buffer in
-            if let baseAddress = buffer.baseAddress {
-                memcpy(array.dataPointer, baseAddress, floatData.count * MemoryLayout<Float>.size)
+        guard let array = try? MLMultiArray(shape: shape, dataType: .float32) else { return nil }
+        floatData.withUnsafeBytes { buf in
+            if let base = buf.baseAddress {
+                memcpy(array.dataPointer, base, floatData.count * MemoryLayout<Float>.size)
             }
         }
-
         return (array, cropRect)
     }
 
-    private func predictPose(from array: MLMultiArray) throws -> MLFeatureProvider {
-        guard let model = model else {
-            throw RTMPoseError.modelUnavailable
-        }
-        let input = try MLDictionaryFeatureProvider(
-            dictionary: ["input": MLFeatureValue(multiArray: array)]
-        )
-        return try model.prediction(from: input)
+    // Use the generated input/output types
+    private func predictPose(from array: MLMultiArray) throws -> RTMPoseOutput {
+        guard let model = model else { throw RTMPoseError.modelUnavailable }
+        let input = RTMPoseInput(input: array)
+        return try model.prediction(input: input)
     }
 
     private func decode(
-        prediction: MLFeatureProvider,
+        prediction: RTMPoseOutput,
         cropRect: CGRect,
         videoWidth: Int,
         videoHeight: Int
-    ) -> (keypoints: [RTMPoseKeypoint]) {
-        guard
-            let simccX = prediction.featureValue(for: "simcc_x")?.multiArrayValue,
-            let simccY = prediction.featureValue(for: "simcc_y")?.multiArrayValue
-        else {
-            return (keypoints: [])
-        }
+    ) -> [RTMPoseKeypoint] {
+        let simccX = prediction.simcc_x
+        let simccY = prediction.simcc_y
 
         let keypointCount = Int(truncating: simccX.shape[1])
         let lengthX = Int(truncating: simccX.shape[2])
         let lengthY = Int(truncating: simccY.shape[2])
+
         guard
             let valuesX = extractFloats(from: simccX),
             let valuesY = extractFloats(from: simccY)
-        else {
-            return (keypoints: [])
-        }
+        else { return [] }
 
         var keypoints: [RTMPoseKeypoint] = []
         keypoints.reserveCapacity(keypointCount)
@@ -598,46 +552,34 @@ final class RTMPoseAnalyzer {
 
             var maxX: Float = -Float.greatestFiniteMagnitude
             var idxX = 0
-            for idx in 0..<lengthX {
-                let value = valuesX[baseX + idx]
-                if value > maxX {
-                    maxX = value
-                    idxX = idx
-                }
-            }
+            for i in 0..<lengthX { if valuesX[baseX + i] > maxX { maxX = valuesX[baseX + i]; idxX = i } }
 
             var maxY: Float = -Float.greatestFiniteMagnitude
             var idxY = 0
-            for idx in 0..<lengthY {
-                let value = valuesY[baseY + idx]
-                if value > maxY {
-                    maxY = value
-                    idxY = idx
-                }
-            }
+            for i in 0..<lengthY { if valuesY[baseY + i] > maxY { maxY = valuesY[baseY + i]; idxY = i } }
 
             let xIn = Double(idxX) / simccRatio
             let yIn = Double(idxY) / simccRatio
 
-            let mappedX = min(Double(videoWidth), max(0, cropRect.minX + xIn * scaleX))
+            let mappedX = min(Double(videoWidth),  max(0, cropRect.minX + xIn * scaleX))
             let mappedY = min(Double(videoHeight), max(0, cropRect.minY + yIn * scaleY))
 
             let jointScore = max(0, min(1, Double((maxX + maxY) / 2.0)))
             keypoints.append(RTMPoseKeypoint(x: mappedX, y: mappedY, score: jointScore))
         }
 
-        return (keypoints: keypoints)
+        return keypoints
     }
 
     private func extractFloats(from multiArray: MLMultiArray) -> [Float]? {
         let count = multiArray.count
         switch multiArray.dataType {
         case .float32:
-            let pointer = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
-            return Array(UnsafeBufferPointer(start: pointer, count: count))
+            let p = multiArray.dataPointer.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: p, count: count))
         case .double:
-            let pointer = multiArray.dataPointer.bindMemory(to: Double.self, capacity: count)
-            return (0..<count).map { Float(pointer[$0]) }
+            let p = multiArray.dataPointer.bindMemory(to: Double.self, capacity: count)
+            return (0..<count).map { Float(p[$0]) }
         default:
             return nil
         }
@@ -648,44 +590,26 @@ final class RTMPoseAnalyzer {
         keypoints: [RTMPoseKeypoint],
         outputURL: URL
     ) throws -> URL {
-        let width = baseImage.width
-        let height = baseImage.height
-        let size = CGSize(width: width, height: height)
-        let renderer = UIGraphicsImageRenderer(size: size)
-        let image = renderer.image { context in
-            let cgContext = context.cgContext
-            cgContext.draw(baseImage, in: CGRect(origin: .zero, size: size))
-            cgContext.setLineWidth(4)
-            cgContext.setLineCap(.round)
-            cgContext.setStrokeColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
-            cgContext.setFillColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
-
-            for (start, end) in skeletonPairs {
-                guard start < keypoints.count, end < keypoints.count else { continue }
-                let a = keypoints[start]
-                let b = keypoints[end]
+        let width = baseImage.width, height = baseImage.height
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
+        let image = renderer.image { ctx in
+            let cg = ctx.cgContext
+            cg.draw(baseImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            cg.setLineWidth(4); cg.setLineCap(.round)
+            cg.setStrokeColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+            cg.setFillColor(red: 0.2, green: 0.9, blue: 0.2, alpha: 0.9)
+            for (aIdx, bIdx) in skeletonPairs where aIdx < keypoints.count && bIdx < keypoints.count {
+                let a = keypoints[aIdx], b = keypoints[bIdx]
                 if a.score <= 0 || b.score <= 0 { continue }
-                cgContext.move(to: CGPoint(x: a.x, y: a.y))
-                cgContext.addLine(to: CGPoint(x: b.x, y: b.y))
-                cgContext.strokePath()
+                cg.move(to: CGPoint(x: a.x, y: a.y)); cg.addLine(to: CGPoint(x: b.x, y: b.y)); cg.strokePath()
             }
-
-            let pointRadius: CGFloat = 6
-            for keypoint in keypoints where keypoint.score > 0 {
-                let rect = CGRect(
-                    x: keypoint.x - pointRadius / 2,
-                    y: keypoint.y - pointRadius / 2,
-                    width: pointRadius,
-                    height: pointRadius
-                )
-                cgContext.fillEllipse(in: rect)
+            let r: CGFloat = 6
+            for kp in keypoints where kp.score > 0 {
+                cg.fillEllipse(in: CGRect(x: kp.x - r/2, y: kp.y - r/2, width: r, height: r))
             }
         }
-
-        guard let jpegData = image.jpegData(compressionQuality: 0.85) else {
-            throw RTMPoseError.failedToCreatePreview
-        }
-        try jpegData.write(to: outputURL, options: .atomic)
+        guard let jpeg = image.jpegData(compressionQuality: 0.85) else { throw RTMPoseError.failedToCreatePreview }
+        try jpeg.write(to: outputURL, options: .atomic)
         return outputURL
     }
 
@@ -695,24 +619,18 @@ final class RTMPoseAnalyzer {
         videoHeight: Int,
         paddingFactor: Double
     ) -> CGRect {
-        let centerX = Double(box.x) + Double(box.w) / 2.0
-        let centerY = Double(box.y) + Double(box.h) / 2.0
-        let paddedWidth = Double(box.w) * paddingFactor
-        let paddedHeight = Double(box.h) * paddingFactor
-
-        var minX = centerX - paddedWidth / 2.0
-        var minY = centerY - paddedHeight / 2.0
-        var maxX = centerX + paddedWidth / 2.0
-        var maxY = centerY + paddedHeight / 2.0
-
-        minX = max(0, minX)
-        minY = max(0, minY)
-        maxX = min(Double(videoWidth), maxX)
-        maxY = min(Double(videoHeight), maxY)
-
+        let cx = Double(box.x) + Double(box.w) / 2.0
+        let cy = Double(box.y) + Double(box.h) / 2.0
+        let pw = Double(box.w) * paddingFactor
+        let ph = Double(box.h) * paddingFactor
+        var minX = cx - pw/2, minY = cy - ph/2
+        var maxX = cx + pw/2, maxY = cy + ph/2
+        minX = max(0, minX); minY = max(0, minY)
+        maxX = min(Double(videoWidth), maxX); maxY = min(Double(videoHeight), maxY)
         return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
     }
 }
+
 
 enum VideoAnalysisStage: String {
     case yolo
