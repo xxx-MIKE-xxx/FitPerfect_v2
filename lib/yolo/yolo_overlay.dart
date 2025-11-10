@@ -116,9 +116,21 @@ class _YoloPainter extends CustomPainter {
       return;
     }
 
-    final scale = math.min(size.width / videoWidth, size.height / videoHeight);
-    final dx = (size.width - videoWidth * scale) / 2;
-    final dy = (size.height - videoHeight * scale) / 2;
+    final Size videoSize = Size(videoWidth.toDouble(), videoHeight.toDouble());
+    final FittedSizes fitted = applyBoxFit(BoxFit.contain, videoSize, size);
+    final Size destination = fitted.destination;
+    final Offset padding = Offset(
+      (size.width - destination.width) / 2,
+      (size.height - destination.height) / 2,
+    );
+
+    final double sx = destination.width / videoSize.width;
+    final double sy = destination.height / videoSize.height;
+
+    Offset mapVideoToCanvas(Offset p) => Offset(
+          p.dx * sx + padding.dx,
+          p.dy * sy + padding.dy,
+        );
 
     final rectPaint = Paint()
       ..color = Colors.greenAccent
@@ -126,9 +138,13 @@ class _YoloPainter extends CustomPainter {
       ..strokeWidth = 2;
 
     for (final box in boxes) {
-      final left = dx + box.x * scale;
-      final top  = dy + box.y * scale;
-      final rect = Rect.fromLTWH(left, top, box.w * scale, box.h * scale);
+      final Offset topLeft = mapVideoToCanvas(Offset(box.x.toDouble(), box.y.toDouble()));
+      final Rect rect = Rect.fromLTWH(
+        topLeft.dx,
+        topLeft.dy,
+        box.w * sx,
+        box.h * sy,
+      );
       canvas.drawRect(rect, rectPaint);
 
       final labelText = box.label.isNotEmpty
@@ -150,11 +166,11 @@ class _YoloPainter extends CustomPainter {
         textDirection: TextDirection.ltr,
       )..layout();
 
-      final padding = const EdgeInsets.symmetric(horizontal: 6, vertical: 2);
-      final labelWidth = textPainter.width + padding.horizontal;
-      final labelHeight = textPainter.height + padding.vertical;
+      final labelPadding = const EdgeInsets.symmetric(horizontal: 6, vertical: 2);
+      final labelWidth = textPainter.width + labelPadding.horizontal;
+      final labelHeight = textPainter.height + labelPadding.vertical;
       final labelLeft = rect.left;
-      final labelTop = math.max(rect.top - labelHeight, dy);
+      final labelTop = math.max(rect.top - labelHeight, padding.dy);
       final backgroundRect = Rect.fromLTWH(
         labelLeft,
         labelTop,
@@ -173,8 +189,8 @@ class _YoloPainter extends CustomPainter {
       textPainter.paint(
         canvas,
         Offset(
-          backgroundRect.left + padding.left,
-          backgroundRect.top + padding.top,
+          backgroundRect.left + labelPadding.left,
+          backgroundRect.top + labelPadding.top,
         ),
       );
     }

@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
@@ -204,17 +202,41 @@ class _RtmposePainter extends CustomPainter {
       return;
     }
 
-    final effectiveWidth =
-        videoWidth > 0 ? videoWidth.toDouble() : (usesNormalizedCoordinates ? 1.0 : size.width);
-    final effectiveHeight =
-        videoHeight > 0 ? videoHeight.toDouble() : (usesNormalizedCoordinates ? 1.0 : size.height);
-    if (effectiveWidth <= 0 || effectiveHeight <= 0) {
+    final double resolvedWidth = videoWidth > 0
+        ? videoWidth.toDouble()
+        : (usesNormalizedCoordinates ? 1.0 : size.width);
+    final double resolvedHeight = videoHeight > 0
+        ? videoHeight.toDouble()
+        : (usesNormalizedCoordinates ? 1.0 : size.height);
+    if (resolvedWidth <= 0 || resolvedHeight <= 0) {
       return;
     }
 
-    final scale = math.min(size.width / effectiveWidth, size.height / effectiveHeight);
-    final dx = (size.width - effectiveWidth * scale) / 2;
-    final dy = (size.height - effectiveHeight * scale) / 2;
+    final Size videoSize = Size(resolvedWidth, resolvedHeight);
+    final FittedSizes fitted = applyBoxFit(BoxFit.contain, videoSize, size);
+    final Size destination = fitted.destination;
+    final Offset padding = Offset(
+      (size.width - destination.width) / 2,
+      (size.height - destination.height) / 2,
+    );
+
+    final double sx = destination.width / videoSize.width;
+    final double sy = destination.height / videoSize.height;
+
+    Offset mapVideoToCanvas(Offset p) => Offset(
+          p.dx * sx + padding.dx,
+          p.dy * sy + padding.dy,
+        );
+
+    Offset resolveJointPosition(RtmposeJoint joint) {
+      double px = joint.x;
+      double py = joint.y;
+      if (usesNormalizedCoordinates) {
+        px *= videoSize.width;
+        py *= videoSize.height;
+      }
+      return mapVideoToCanvas(Offset(px, py));
+    }
 
     final jointPaint = Paint()
       ..color = Colors.lightBlueAccent
@@ -228,29 +250,19 @@ class _RtmposePainter extends CustomPainter {
 
     final jointsByIndex = {for (final joint in joints) joint.index: joint};
 
-    Offset _resolvePosition(RtmposeJoint joint) {
-      double px = joint.x;
-      double py = joint.y;
-      if (usesNormalizedCoordinates) {
-        px *= effectiveWidth;
-        py *= effectiveHeight;
-      }
-      return Offset(dx + px * scale, dy + py * scale);
-    }
-
     for (final pair in _skeleton) {
       final first = jointsByIndex[pair[0]];
       final second = jointsByIndex[pair[1]];
       if (first == null || second == null) {
         continue;
       }
-      final p1 = _resolvePosition(first);
-      final p2 = _resolvePosition(second);
+      final p1 = resolveJointPosition(first);
+      final p2 = resolveJointPosition(second);
       canvas.drawLine(p1, p2, linePaint);
     }
 
     for (final joint in joints) {
-      final point = _resolvePosition(joint);
+      final point = resolveJointPosition(joint);
       canvas.drawCircle(point, 5, jointPaint);
     }
   }
