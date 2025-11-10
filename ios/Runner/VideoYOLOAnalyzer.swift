@@ -343,7 +343,6 @@ final class RTMPoseAnalyzer {
         var framesWithDetections = 0
         var previewURL: URL?
         var numKeypointsDetected = 0
-
         let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
         let poseJSONURL = sessionURL.appendingPathComponent("rtmpose_keypoints.json")
         let previewOutputURL = sessionURL.appendingPathComponent("rtmpose_preview.jpg")
@@ -389,9 +388,8 @@ final class RTMPoseAnalyzer {
                     return
                 }
 
-                if numKeypointsDetected == 0 {
-                    numKeypointsDetected = keypoints.count   // <-- fix
-                }
+                // Track the maximum number of keypoints detected on any frame
+                numKeypointsDetected = max(numKeypointsDetected, keypoints.count)
 
                 frames.append(RTMPoseFrame(t: frame.t, ok: true, keypoints: keypoints))
                 framesWithDetections += 1
@@ -405,6 +403,7 @@ final class RTMPoseAnalyzer {
                 }
             }
         }
+
 
         let totals = RTMPoseTotals(
             framesProcessed: frames.count,
@@ -528,35 +527,56 @@ final class RTMPoseAnalyzer {
         videoWidth: Int,
         videoHeight: Int
     ) -> [RTMPoseKeypoint] {
+
         let simccX = prediction.simcc_x
         let simccY = prediction.simcc_y
 
-        let keypointCount = Int(truncating: simccX.shape[1])
-        let lengthX = Int(truncating: simccX.shape[2])
-        let lengthY = Int(truncating: simccY.shape[2])
+        // Shapes & strides
+        let dx = simccX.shape.map { Int(truncating: $0) }   // e.g. [1,17,384] or [1,384,17]
+        let dy = simccY.shape.map { Int(truncating: $0) }
+        let sx = simccX.strides.map { Int(truncating: $0) } // e.g. [17*384, 384, 1] if [B,K,W]
+        let sy = simccY.strides.map { Int(truncating: $0) }
 
-        guard
-            let valuesX = extractFloats(from: simccX),
-            let valuesY = extractFloats(from: simccY)
-        else { return [] }
+        // Find which dim is Keypoints (K) and which is the SIMCC length (W)
+        func dims(_ d: [Int]) -> (kIdx: Int, wIdx: Int, K: Int, W: Int) {
+            // Prefer a known K (17/26/29); otherwise pick the smaller of the last two dims.
+            let candidates: Set<Int> = [17, 26, 29]
+            let kIdx = (d.indices.first { candidates.contains(d[$0]) } ?? ((d[1] < d[2]) ? 1 : 2))
+            let wIdx = (kIdx == 1) ? 2 : 1
+            return (kIdx, wIdx, d[kIdx], d[wIdx])
+        }
+
+        let (kIdxX, wIdxX, Kx, Wx) = dims(dx)
+        let (kIdxY, wIdxY, Ky, Wy) = dims(dy)
+        let K = min(Kx, Ky)            // safety if they differ slightly
+        let WX = Wx, WY = Wy
+
+        // Raw pointers
+        let px = simccX.dataPointer.bindMemory(to: Float.self, capacity: simccX.count)
+        let py = simccY.dataPointer.bindMemory(to: Float.self, capacity: simccY.count)
+
+        // Stride helpers to compute flat offsets
+        func offX(_ k: Int, _ i: Int) -> Int { k * sx[kIdxX] + i * sx[wIdxX] }
+        func offY(_ k: Int, _ i: Int) -> Int { k * sy[kIdxY] + i * sy[wIdxY] }
 
         var keypoints: [RTMPoseKeypoint] = []
-        keypoints.reserveCapacity(keypointCount)
+        keypoints.reserveCapacity(K)
 
-        let scaleX = cropRect.width / Double(inputWidth)
+        let scaleX = cropRect.width  / Double(inputWidth)
         let scaleY = cropRect.height / Double(inputHeight)
 
-        for k in 0..<keypointCount {
-            let baseX = k * lengthX
-            let baseY = k * lengthY
+        for k in 0..<K {
+            var maxX: Float = -Float.greatestFiniteMagnitude, idxX = 0
+            for i in 0..<WX {
+                let v = px[offX(k, i)]
+                if v > maxX { maxX = v; idxX = i }
+            }
 
-            var maxX: Float = -Float.greatestFiniteMagnitude
-            var idxX = 0
-            for i in 0..<lengthX { if valuesX[baseX + i] > maxX { maxX = valuesX[baseX + i]; idxX = i } }
-
-            var maxY: Float = -Float.greatestFiniteMagnitude
-            var idxY = 0
-            for i in 0..<lengthY { if valuesY[baseY + i] > maxY { maxY = valuesY[baseY + i]; idxY = i } }
+            var maxY: Float = -Float.greatestFiniteMagnitude, idxY = 0
+            for i in 0..<WY {
+                let v = py[offY(k, i)]
+                if v > maxY { maxY = v; idxY = i }
+            }
 
             let xIn = Double(idxX) / simccRatio
             let yIn = Double(idxY) / simccRatio
@@ -564,12 +584,13 @@ final class RTMPoseAnalyzer {
             let mappedX = min(Double(videoWidth),  max(0, cropRect.minX + xIn * scaleX))
             let mappedY = min(Double(videoHeight), max(0, cropRect.minY + yIn * scaleY))
 
-            let jointScore = max(0, min(1, Double((maxX + maxY) / 2.0)))
-            keypoints.append(RTMPoseKeypoint(x: mappedX, y: mappedY, score: jointScore))
+            let score = max(0, min(1, Double((maxX + maxY) / 2.0)))
+            keypoints.append(RTMPoseKeypoint(x: mappedX, y: mappedY, score: score))
         }
 
         return keypoints
     }
+
 
     private func extractFloats(from multiArray: MLMultiArray) -> [Float]? {
         let count = multiArray.count
