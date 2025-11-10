@@ -34,11 +34,15 @@ class _CameraPageState extends State<CameraPage> {
   String? _yoloJsonPath;
   String? _poseJsonPath;
   String? _posePreviewPath;
+  String? _motionJsonPath;
+  String? _motionPreviewPath;
   int _framesAnalyzed = 0;
   int _detections = 0;
   int _poseFramesProcessed = 0;
   int _poseFramesWithDetections = 0;
   int _poseKeypoints = 0;
+  int _motionFramesProcessed = 0;
+  int _motionFramesWith3D = 0;
   String? _cameraError;
   final ValueNotifier<String> _analysisStatus = ValueNotifier<String>('Analyzing…');
 
@@ -201,18 +205,29 @@ class _CameraPageState extends State<CameraPage> {
           _yoloJsonPath = summary?.yoloJsonPath;
           _poseJsonPath = summary?.poseJsonPath;
           _posePreviewPath = summary?.posePreviewPath;
+          _motionJsonPath = summary?.motionJsonPath;
+          _motionPreviewPath = summary?.motionPreviewPath;
           _framesAnalyzed = summary?.yoloFrames ?? 0;
           _detections = summary?.yoloDetections ?? 0;
           _poseFramesProcessed = summary?.poseFrames ?? 0;
           _poseFramesWithDetections = summary?.poseDetections ?? 0;
           _poseKeypoints = summary?.poseKeypoints ?? 0;
+          _motionFramesProcessed = summary?.motionFrames ?? 0;
+          _motionFramesWith3D = summary?.motionFramesWith3D ?? 0;
           _repetitionCount = summary?.yoloDetections ?? 0;
         });
 
         if (summary != null) {
-          final message =
-              'YOLO: ${summary.yoloDetections} detections across ${summary.yoloFrames} frames. '
-              'RTMPose: ${summary.poseDetections}/${summary.poseFrames} frames with keypoints.';
+          final motionFrames = summary.motionFrames ?? summary.poseFrames;
+          final motionPart = summary.motionFramesWith3D == null
+              ? ''
+              : ' MotionBERT: ${summary.motionFramesWith3D}/${motionFrames ?? 0} frames with 3D.';
+          final buffer = StringBuffer(
+            'YOLO: ${summary.yoloDetections} detections across ${summary.yoloFrames} frames. '
+            'RTMPose: ${summary.poseDetections}/${summary.poseFrames} frames with keypoints.',
+          );
+          buffer.write(motionPart);
+          final message = buffer.toString();
           _showSnackBar(message);
         }
       } else {
@@ -229,11 +244,15 @@ class _CameraPageState extends State<CameraPage> {
           _yoloJsonPath = null;
           _poseJsonPath = null;
           _posePreviewPath = null;
+          _motionJsonPath = null;
+          _motionPreviewPath = null;
           _framesAnalyzed = 0;
           _detections = 0;
           _poseFramesProcessed = 0;
           _poseFramesWithDetections = 0;
           _poseKeypoints = 0;
+          _motionFramesProcessed = 0;
+          _motionFramesWith3D = 0;
         });
 
         // Kick off recording in the background; if it fails, we revert flag
@@ -292,6 +311,7 @@ class _CameraPageState extends State<CameraPage> {
 
     final yolo = result['yolo'];
     final pose = result['rtmpose'];
+    final motion = result['motionbert'];
     if (yolo is! Map || pose is! Map) {
       throw StateError('Analysis response missing stage summaries: $result');
     }
@@ -305,6 +325,17 @@ class _CameraPageState extends State<CameraPage> {
     final poseDetections = (pose['framesWithDetections'] as num?)?.toInt();
     final poseKeypoints = (pose['numKeypoints'] as num?)?.toInt() ?? 0;
     final posePreviewPath = pose['previewPath'] as String?;
+
+    String? motionJsonPath;
+    int? motionFrames;
+    int? motionFramesWith3D;
+    String? motionPreviewPath;
+    if (motion is Map) {
+      motionJsonPath = motion['jsonPath'] as String?;
+      motionFrames = (motion['frames'] as num?)?.toInt();
+      motionFramesWith3D = (motion['framesWith3D'] as num?)?.toInt();
+      motionPreviewPath = motion['previewPath'] as String?;
+    }
 
     if (yoloJsonPath == null || yoloFrames == null || yoloDetections == null) {
       throw StateError('YOLO summary missing fields: $result');
@@ -322,6 +353,10 @@ class _CameraPageState extends State<CameraPage> {
       poseDetections: poseDetections,
       poseKeypoints: poseKeypoints,
       posePreviewPath: posePreviewPath,
+      motionJsonPath: motionJsonPath,
+      motionFrames: motionFrames,
+      motionFramesWith3D: motionFramesWith3D,
+      motionPreviewPath: motionPreviewPath,
     );
   }
 
@@ -348,22 +383,45 @@ class _CameraPageState extends State<CameraPage> {
         FeedbackMetric(label: 'Pose File', value: _poseJsonPath!.split('/').last),
       if (_posePreviewPath != null)
         FeedbackMetric(label: 'Pose Preview', value: _posePreviewPath!.split('/').last),
+      if (_motionFramesProcessed > 0)
+        FeedbackMetric(label: 'MotionBERT Frames', value: '$_motionFramesProcessed'),
+      if (_motionFramesWith3D > 0)
+        FeedbackMetric(label: 'Frames With 3D', value: '$_motionFramesWith3D'),
+      if (_motionJsonPath != null)
+        FeedbackMetric(
+          label: 'MotionBERT File',
+          value: _motionJsonPath!.split('/').last,
+        ),
+      if (_motionPreviewPath != null)
+        FeedbackMetric(
+          label: 'MotionBERT Preview',
+          value: _motionPreviewPath!.split('/').last,
+        ),
     ];
 
     final sessionDirPath = _sessionDir?.path ?? File(videoPath).parent.path;
+
+    final motionSummary = _motionFramesProcessed > 0
+        ? ' MotionBERT lifted $_motionFramesWith3D of $_motionFramesProcessed frames into 3D.'
+        : '';
 
     final session = FeedbackSession(
       exercise: widget.exercise,
       videoPath: videoPath,
       sessionDir: sessionDirPath,
       metrics: metrics,
-      summary: _poseFramesWithDetections > 0
-          ? 'YOLO detected $_detections objects across $_framesAnalyzed frames. '
-              'RTMPose produced keypoints for $_poseFramesWithDetections of $_poseFramesProcessed frames.'
-          : 'No pose keypoints were detected in the sampled frames.',
+      summary: (_poseFramesWithDetections > 0
+              ? 'YOLO detected $_detections objects across $_framesAnalyzed frames. '
+                  'RTMPose produced keypoints for $_poseFramesWithDetections of $_poseFramesProcessed frames.'
+              : 'No pose keypoints were detected in the sampled frames.') +
+          motionSummary,
       poseJsonPath: _poseJsonPath,
       yoloJsonPath: _yoloJsonPath,
       posePreviewPath: _posePreviewPath,
+      motionJsonPath: _motionJsonPath,
+      motionPreviewPath: _motionPreviewPath,
+      motionFrames: _motionFramesProcessed,
+      motionFramesWith3D: _motionFramesWith3D,
     );
 
     context.push('/feedback', extra: session);
@@ -587,6 +645,10 @@ class _AnalysisSummary {
     required this.poseDetections,
     required this.poseKeypoints,
     this.posePreviewPath,
+    this.motionJsonPath,
+    this.motionFrames,
+    this.motionFramesWith3D,
+    this.motionPreviewPath,
   });
 
   final String yoloJsonPath;
@@ -597,6 +659,10 @@ class _AnalysisSummary {
   final int poseDetections;
   final int poseKeypoints;
   final String? posePreviewPath;
+  final String? motionJsonPath;
+  final int? motionFrames;
+  final int? motionFramesWith3D;
+  final String? motionPreviewPath;
 }
 
 /// Top-level function used by `compute`.

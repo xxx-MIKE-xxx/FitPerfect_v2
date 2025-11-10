@@ -23,6 +23,10 @@ class FeedbackSession {
   final String? poseJsonPath;
   final String? yoloJsonPath;
   final String? posePreviewPath;
+  final String? motionJsonPath;
+  final String? motionPreviewPath;
+  final int? motionFrames;
+  final int? motionFramesWith3D;
 
   const FeedbackSession({
     required this.exercise,
@@ -33,5 +37,9 @@ class FeedbackSession {
     this.poseJsonPath,
     this.yoloJsonPath,
     this.posePreviewPath,
+    this.motionJsonPath,
+    this.motionPreviewPath,
+    this.motionFrames,
+    this.motionFramesWith3D,
   });
 }

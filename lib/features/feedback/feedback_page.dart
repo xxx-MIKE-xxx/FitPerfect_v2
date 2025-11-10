@@ -400,6 +400,8 @@ Future<String> zipRun(FeedbackSession session) async {
     session.yoloJsonPath,
     session.poseJsonPath,
     session.posePreviewPath,
+    session.motionJsonPath,
+    session.motionPreviewPath,
   }..removeWhere((path) => path == null || path!.isEmpty);
 
   for (final path in additionalPaths.cast<String>()) {
