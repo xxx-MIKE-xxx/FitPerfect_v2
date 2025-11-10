@@ -846,10 +846,348 @@ final class RTMPoseAnalyzer {
 }
 
 // =====================================================
+// MARK: – MotionBERT-Lite (2D → 3D lifting)
+// =====================================================
+
+private let MOTIONBERT_TEMPORAL = 243
+private let MOTIONBERT_CENTER = 121
+private let MOTIONBERT_HEAD_TOP_FACTOR: Double = 0.6
+
+enum MotionBERTError: Error {
+    case poseJSONUnavailable
+    case modelResourceMissing
+    case modelUnavailable
+    case predictionFailed
+}
+
+struct MotionBERTKeypoint3D: Codable {
+    let X: Double
+    let Y: Double
+    let Z: Double
+}
+
+struct MotionBERTFrameOutput: Codable {
+    let t: Double
+    let ok: Bool
+    let keypoints3d: [MotionBERTKeypoint3D]
+}
+
+struct MotionBERTTotals: Codable {
+    let framesProcessed: Int
+    let framesWith3D: Int
+}
+
+struct MotionBERTJSONOutput: Codable {
+    struct Debug: Codable {
+        let inputShape: [Int]
+        let outputShape: [Int]
+        let mapping: String
+        let windowing: String
+    }
+
+    let videoWidth: Int
+    let videoHeight: Int
+    let fps: Double
+    let sampledFps: Double
+    let temporalWindow: Int
+    let skeleton: String
+    let frames: [MotionBERTFrameOutput]
+    let totals: MotionBERTTotals
+    let debug: Debug
+}
+
+struct MotionBERTSummary {
+    let jsonURL: URL
+    let previewURL: URL?
+    let totals: MotionBERTTotals
+}
+
+final class MotionBERTAnalyzer {
+    private struct Joint2D {
+        let x: Double
+        let y: Double
+        let score: Double
+    }
+
+    private struct Frame2D {
+        let timestamp: Double
+        let joints: [Joint2D]
+    }
+
+    private var model: MLModel?
+
+    func analyze(sessionDirectory: String, poseSummary: RTMPoseSummary) throws -> MotionBERTSummary? {
+        guard let poseData = try? Data(contentsOf: poseSummary.jsonURL) else {
+            throw MotionBERTError.poseJSONUnavailable
+        }
+
+        let decoder = JSONDecoder()
+        let poseOutput: RTMPoseJSONOutput
+        do {
+            poseOutput = try decoder.decode(RTMPoseJSONOutput.self, from: poseData)
+        } catch {
+            throw MotionBERTError.poseJSONUnavailable
+        }
+
+        NSLog("[MotionBERT] F=243, H36M-17, input=(x,y,conf) from RTMPose pixels; window=center=121")
+
+        let frames2D = prepareFrames(from: poseOutput.frames)
+        let frameCount = frames2D.count
+        if frameCount == 0 {
+            NSLog("[MotionBERT] No RTMPose frames found; skipping MotionBERT stage.")
+            return nil
+        }
+
+        let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
+        let outputURL = sessionURL.appendingPathComponent("motionbert_3d_keypoints.json")
+
+        guard let modelURL = Bundle.main.url(forResource: "motionbert_lite_patched", withExtension: "mlmodelc") else {
+            throw MotionBERTError.modelResourceMissing
+        }
+
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = .cpuAndNeuralEngine
+
+        guard let motionModel = try? MLModel(contentsOf: modelURL, configuration: configuration) else {
+            throw MotionBERTError.modelUnavailable
+        }
+
+        model = motionModel
+        NSLog("[MotionBERT] Model loaded (computeUnits=NeuralEngine) — running…")
+
+        var framesWith3D = 0
+        var outputs: [MotionBERTFrameOutput] = []
+        outputs.reserveCapacity(frameCount)
+
+        if frameCount <= MOTIONBERT_TEMPORAL {
+            let padLeft = (MOTIONBERT_TEMPORAL - frameCount) / 2
+            let padRight = MOTIONBERT_TEMPORAL - frameCount - padLeft
+            let first = frames2D.first!
+            let last = frames2D.last!
+            let padded = Array(repeating: first, count: padLeft) + frames2D + Array(repeating: last, count: padRight)
+            guard let prediction = try? predict(window: padded) else {
+                throw MotionBERTError.predictionFailed
+            }
+
+            for (index, frame) in frames2D.enumerated() {
+                let timeIndex = padLeft + index
+                let joints3d = extractFrame(from: prediction, timeIndex: timeIndex)
+                outputs.append(MotionBERTFrameOutput(t: frame.timestamp, ok: true, keypoints3d: joints3d))
+            }
+            framesWith3D = frameCount
+        } else {
+            for i in 0..<frameCount {
+                let prediction: MLMultiArray = try autoreleasepool {
+                    let window = makeWindow(around: i, frames: frames2D)
+                    return try self.predict(window: window)
+                }
+                let joints3d = self.extractFrame(from: prediction, timeIndex: MOTIONBERT_CENTER)
+                outputs.append(MotionBERTFrameOutput(t: frames2D[i].timestamp, ok: true, keypoints3d: joints3d))
+                framesWith3D += 1
+            }
+        }
+
+        let totals = MotionBERTTotals(framesProcessed: frameCount, framesWith3D: framesWith3D)
+
+        let jsonOutput = MotionBERTJSONOutput(
+            videoWidth: poseOutput.videoWidth,
+            videoHeight: poseOutput.videoHeight,
+            fps: poseOutput.fps,
+            sampledFps: poseOutput.sampledFps,
+            temporalWindow: MOTIONBERT_TEMPORAL,
+            skeleton: "H36M-17",
+            frames: outputs,
+            totals: totals,
+            debug: .init(
+                inputShape: [1, MOTIONBERT_TEMPORAL, 17, 3],
+                outputShape: [1, MOTIONBERT_TEMPORAL, 17, 3],
+                mapping: "COCO17->H36M17, HEAD_TOP_FACTOR=0.6, spine=mid(pelvis,neck)",
+                windowing: "center=121, pad=repeat"
+            )
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(jsonOutput).write(to: outputURL, options: .atomic)
+
+        NSLog("[MotionBERT] frames=%d ok=%d -> saved motionbert_3d_keypoints.json", frameCount, framesWith3D)
+
+        return MotionBERTSummary(jsonURL: outputURL, previewURL: nil, totals: totals)
+    }
+
+    func teardown() {
+        model = nil
+    }
+
+    // MARK: – Helpers
+
+    private func prepareFrames(from frames: [RTMPoseFrame]) -> [Frame2D] {
+        var prepared: [Frame2D] = []
+        prepared.reserveCapacity(frames.count)
+
+        var lastKnown: [Joint2D?] = Array(repeating: nil, count: 17)
+        let counterpart: [Int: Int] = [
+            1: 2, 2: 1,
+            3: 4, 4: 3,
+            5: 6, 6: 5,
+            7: 8, 8: 7,
+            9: 10, 10: 9,
+            11: 12, 12: 11,
+            13: 14, 14: 13,
+            15: 16, 16: 15
+        ]
+
+        for frame in frames {
+            var coco: [Joint2D] = []
+            coco.reserveCapacity(17)
+
+            for index in 0..<17 {
+                var joint: Joint2D?
+
+                if frame.ok, index < frame.keypoints.count {
+                    let kp = frame.keypoints[index]
+                    if kp.score > 0 {
+                        joint = Joint2D(x: kp.x, y: kp.y, score: kp.score)
+                    }
+                }
+
+                if joint == nil, let previous = lastKnown[index] {
+                    joint = previous
+                }
+
+                if joint == nil, let mirrorIndex = counterpart[index] {
+                    if frame.ok, mirrorIndex < frame.keypoints.count {
+                        let mirror = frame.keypoints[mirrorIndex]
+                        if mirror.score > 0 {
+                            joint = Joint2D(x: mirror.x, y: mirror.y, score: mirror.score)
+                        }
+                    }
+                    if joint == nil, let lastMirror = lastKnown[mirrorIndex] {
+                        joint = lastMirror
+                    }
+                }
+
+                if joint == nil {
+                    joint = Joint2D(x: 0, y: 0, score: 0)
+                }
+
+                let resolved = joint!
+                lastKnown[index] = resolved
+                coco.append(resolved)
+            }
+
+            prepared.append(Frame2D(timestamp: frame.t, joints: convertToH36M(from: coco)))
+        }
+
+        return prepared
+    }
+
+    private func convertToH36M(from coco: [Joint2D]) -> [Joint2D] {
+        func midpoint(_ a: Joint2D, _ b: Joint2D) -> Joint2D {
+            Joint2D(
+                x: (a.x + b.x) / 2.0,
+                y: (a.y + b.y) / 2.0,
+                score: min(a.score, b.score)
+            )
+        }
+
+        let lHip = coco[11]
+        let rHip = coco[12]
+        let pelvis = midpoint(lHip, rHip)
+        let neck = midpoint(coco[5], coco[6])
+        let torso = midpoint(pelvis, neck)
+        let nose = coco[0]
+
+        let headTop = Joint2D(
+            x: nose.x + MOTIONBERT_HEAD_TOP_FACTOR * (nose.x - neck.x),
+            y: nose.y + MOTIONBERT_HEAD_TOP_FACTOR * (nose.y - neck.y),
+            score: nose.score
+        )
+
+        return [
+            pelvis,
+            rHip,
+            coco[14],
+            coco[16],
+            lHip,
+            coco[13],
+            coco[15],
+            torso,
+            neck,
+            nose,
+            headTop,
+            coco[5],
+            coco[7],
+            coco[9],
+            coco[6],
+            coco[8],
+            coco[10]
+        ]
+    }
+
+    private func makeWindow(around index: Int, frames: [Frame2D]) -> [Frame2D] {
+        var window: [Frame2D] = []
+        window.reserveCapacity(MOTIONBERT_TEMPORAL)
+
+        let total = frames.count
+        for offset in 0..<MOTIONBERT_TEMPORAL {
+            let idx = min(max(index - MOTIONBERT_CENTER + offset, 0), total - 1)
+            window.append(frames[idx])
+        }
+        return window
+    }
+
+    private func predict(window: [Frame2D]) throws -> MLMultiArray {
+        guard let model = model else { throw MotionBERTError.modelUnavailable }
+
+        let shape = [1, MOTIONBERT_TEMPORAL, 17, 3].map { NSNumber(value: $0) }
+        let input = try MLMultiArray(shape: shape, dataType: .float32)
+        fill(input: input, with: window)
+
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["input": input])
+        let result = try model.prediction(from: provider)
+
+        guard let output = result.featureValue(for: "output")?.multiArrayValue else {
+            throw MotionBERTError.predictionFailed
+        }
+        return output
+    }
+
+    private func fill(input: MLMultiArray, with frames: [Frame2D]) {
+        let pointer = UnsafeMutablePointer<Float32>(OpaquePointer(input.dataPointer))
+        var offset = 0
+        for frame in frames {
+            for joint in frame.joints {
+                pointer[offset] = Float32(joint.x); offset += 1
+                pointer[offset] = Float32(joint.y); offset += 1
+                pointer[offset] = Float32(joint.score); offset += 1
+            }
+        }
+    }
+
+    private func extractFrame(from output: MLMultiArray, timeIndex: Int) -> [MotionBERTKeypoint3D] {
+        let pointer = UnsafeMutablePointer<Float32>(OpaquePointer(output.dataPointer))
+        var joints: [MotionBERTKeypoint3D] = []
+        joints.reserveCapacity(17)
+
+        let baseOffset = timeIndex * 17 * 3
+        for jointIndex in 0..<17 {
+            let jointOffset = baseOffset + jointIndex * 3
+            let X = Double(pointer[jointOffset])
+            let Y = Double(pointer[jointOffset + 1])
+            let Z = Double(pointer[jointOffset + 2])
+            joints.append(MotionBERTKeypoint3D(X: X, Y: Y, Z: Z))
+        }
+        return joints
+    }
+}
+
+// =====================================================
 // MARK: – Pipeline wrapper
 // =====================================================
 
-enum VideoAnalysisStage: String { case yolo, rtmpose }
+enum VideoAnalysisStage: String { case yolo, rtmpose, motionbert }
 
 struct VideoAnalysisStageError: Error, LocalizedError {
     let stage: VideoAnalysisStage
@@ -863,6 +1201,7 @@ struct VideoAnalysisStageError: Error, LocalizedError {
 struct VideoAnalysisResult {
     let yolo: YOLOAnalysisSummary
     let rtmpose: RTMPoseSummary
+    let motionbert: MotionBERTSummary?
 }
 
 final class VideoAnalysisPipeline {
@@ -888,19 +1227,35 @@ final class VideoAnalysisPipeline {
 
                 progress?("Running RTMPose…")
                 let poseSummary: RTMPoseSummary = try autoreleasepool {
-                    let a = RTMPoseAnalyzer(personStrategy: personStrategy)
-                    defer { a.teardown() }
-                    return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, yoloJSONURL: yoloSummary.jsonURL)
+                    var analyzer: RTMPoseAnalyzer? = RTMPoseAnalyzer(personStrategy: personStrategy)
+                    defer {
+                        analyzer?.teardown()
+                        analyzer = nil
+                    }
+                    return try analyzer!.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, yoloJSONURL: yoloSummary.jsonURL)
                 }
                 NSLog("RTMPose stage complete. frames=%d ok=%d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
 
-                completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary)))
+                progress?("Running MotionBERT…")
+                NSLog("[MotionBERT] Releasing RTMPose and freeing memory…")
+                let motionSummary: MotionBERTSummary? = try autoreleasepool {
+                    var analyzer: MotionBERTAnalyzer? = MotionBERTAnalyzer()
+                    defer {
+                        analyzer?.teardown()
+                        analyzer = nil
+                    }
+                    return try analyzer?.analyze(sessionDirectory: sessionDirectory, poseSummary: poseSummary)
+                }
+
+                completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary, motionbert: motionSummary)))
             } catch let e as VideoAnalysisStageError {
                 completion(.failure(e))
             } catch let e as YOLOAnalysisError {
                 completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: e)))
             } catch let e as RTMPoseError {
                 completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: e)))
+            } catch let e as MotionBERTError {
+                completion(.failure(VideoAnalysisStageError(stage: .motionbert, underlying: e)))
             } catch {
                 completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
             }

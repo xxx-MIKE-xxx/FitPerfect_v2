@@ -60,7 +60,20 @@ import UIKit
                   poseInfo["previewPath"] = preview.path
                 }
 
-                let response: [String: Any] = [
+                var motionInfo: [String: Any]?
+                if let motion = summary.motionbert {
+                  var info: [String: Any] = [
+                    "frames": motion.totals.framesProcessed,
+                    "framesWith3D": motion.totals.framesWith3D,
+                    "jsonPath": motion.jsonURL.path
+                  ]
+                  if let preview = motion.previewURL {
+                    info["previewPath"] = preview.path
+                  }
+                  motionInfo = info
+                }
+
+                var response: [String: Any] = [
                   "ok": true,
                   "yolo": [
                     "frames": summary.yolo.totals.framesProcessed,
@@ -69,6 +82,9 @@ import UIKit
                   ],
                   "rtmpose": poseInfo
                 ]
+                if let motionInfo = motionInfo {
+                  response["motionbert"] = motionInfo
+                }
                 result(response)
               case let .failure(error):
                 let response: [String: Any] = [
