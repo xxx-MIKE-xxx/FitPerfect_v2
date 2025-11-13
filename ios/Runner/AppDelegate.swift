@@ -52,7 +52,7 @@ import UIKit
 
         logKeysOnce(arguments, tag: "BRIDGE_ARGS", onlyOnce: &self.shouldLogBridgeArgumentKeys)
 
-        let sampledFps = (arguments["sampledFps"] as? Double) ?? 3.0
+        let sampledFps = (arguments["sampledFps"] as? Double) ?? 10.0
         let personStrategyString = (arguments["person"] as? String) ?? PersonSelectionStrategy.bestScore.rawValue
         let personStrategy = PersonSelectionStrategy(rawValue: personStrategyString) ?? .bestScore
 

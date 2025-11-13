@@ -154,7 +154,7 @@ final class VideoYOLOAnalyzer {
                   mlmodelcURL?.path ?? "nil", mlpackageURL?.path ?? "nil")
             throw YOLOAnalysisError.modelUnavailable
         }
-        let yoloModel = try MLModel.load(contentsOf: modelURL, configuration: configuration)
+        let yoloModel = try MLModel(contentsOf: modelURL, configuration: configuration)
         model = yoloModel
         visionModel = try VNCoreMLModel(for: yoloModel)
         let modelSource = modelURL.pathExtension.lowercased() == "mlmodelc" ? "mlmodelc" : "mlpackage"
@@ -1190,9 +1190,17 @@ final class MotionBERTAnalyzer {
 
     private func fill(input: MLMultiArray, with frames: [Frame2D]) {
         let pointer = UnsafeMutablePointer<Float32>(OpaquePointer(input.dataPointer))
+        let maxCount = input.count
         var offset = 0
+
         for frame in frames {
             for joint in frame.joints {
+                // Make sure we never write past the end of the MLMultiArray
+                if offset + 2 >= maxCount {
+                    NSLog("[MotionBERT] fill: would write past input array (max=%d, offset=%d)", maxCount, offset)
+                    return
+                }
+
                 pointer[offset] = Float32(joint.x); offset += 1
                 pointer[offset] = Float32(joint.y); offset += 1
                 pointer[offset] = Float32(joint.score); offset += 1
@@ -1200,12 +1208,24 @@ final class MotionBERTAnalyzer {
         }
     }
 
+
     private func extractFrame(from output: MLMultiArray, timeIndex: Int) -> [MotionBERTKeypoint3D] {
         let pointer = UnsafeMutablePointer<Float32>(OpaquePointer(output.dataPointer))
+        let maxCount = output.count
+
         var joints: [MotionBERTKeypoint3D] = []
         joints.reserveCapacity(17)
 
         let baseOffset = timeIndex * 17 * 3
+        let required = baseOffset + 17 * 3
+
+        // Safety: don’t read past the end of the output array
+        if required > maxCount {
+            NSLog("[MotionBERT] extractFrame: output too small (count=%d, need=%d, timeIndex=%d)",
+                maxCount, required, timeIndex)
+            return []
+        }
+
         for jointIndex in 0..<17 {
             let jointOffset = baseOffset + jointIndex * 3
             let X = Double(pointer[jointOffset])
@@ -1213,8 +1233,10 @@ final class MotionBERTAnalyzer {
             let Z = Double(pointer[jointOffset + 2])
             joints.append(MotionBERTKeypoint3D(X: X, Y: Y, Z: Z))
         }
+
         return joints
     }
+
 }
 
 // =====================================================
@@ -1269,25 +1291,25 @@ final class VideoAnalysisPipeline {
             defer { self.semaphore.signal() }
             let runID = String(UUID().uuidString.prefix(8))
             let startAll = CFAbsoluteTimeGetCurrent()
-            NSLog("[PIPELINE %s] start video=%@ session=%@ maxConc=%d",
+            NSLog("[PIPELINE %@] start video=%@ session=%@ maxConc=%d",
                   runID, redact(videoPath), sessionDirectory, self.config.runtime.maxConcurrentRuns)
             var currentStage: VideoAnalysisStage = .yolo
             do {
                 progress?("Running YOLO…")
                 var t0 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] YOLO → start", runID)
+                NSLog("[PIPELINE %@] YOLO → start", runID)
                 let yoloSummary: YOLOAnalysisSummary = try autoreleasepool {
                     let a = VideoYOLOAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer { a.teardown() }
                     return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, sampledFps: sampledFps)
                 }
                 var t1 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] YOLO ← done frames=%d detections=%d (%.3fs)",
+                NSLog("[PIPELINE %@] YOLO ← done frames=%d detections=%d (%.3fs)",
                       runID, yoloSummary.totals.framesProcessed, yoloSummary.totals.detections, t1 - t0)
 
                 progress?("Running RTMPose…")
                 t0 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] RTMPose → start", runID)
+                NSLog("[PIPELINE %@] RTMPose → start", runID)
                 let poseSummary: RTMPoseSummary = try autoreleasepool {
                     var analyzer: RTMPoseAnalyzer? = RTMPoseAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer {
@@ -1297,13 +1319,13 @@ final class VideoAnalysisPipeline {
                     return try analyzer!.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, yoloJSONURL: yoloSummary.jsonURL)
                 }
                 t1 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] RTMPose ← done frames=%d ok=%d (%.3fs)",
+                NSLog("[PIPELINE %@] RTMPose ← done frames=%d ok=%d (%.3fs)",
                       runID, poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections, t1 - t0)
                 currentStage = .rtmpose
 
                 progress?("Refining 2D keypoints…")
                 t0 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] postprocess_2d → start", runID)
+                NSLog("[PIPELINE %@] postprocess_2d → start", runID)
                 let postprocessResult: Postprocess2DResult = try autoreleasepool {
                     let processor = PosePostprocessor(
                         config: self.config.postprocess,
@@ -1325,7 +1347,7 @@ final class VideoAnalysisPipeline {
                     sampledFps: postprocessResult.refinedOutput.sampledFps,
                     numKeypoints: postprocessResult.refinedOutput.numKeypoints
                 )
-                NSLog("[PIPELINE %s] postprocess_2d ← done refined=%@ normalized=%@ (%.3fs)",
+                NSLog("[PIPELINE %@] postprocess_2d ← done refined=%@ normalized=%@ (%.3fs)",
                       runID,
                       postprocessSummary.refinedURL.lastPathComponent,
                       postprocessSummary.normalizedURL.lastPathComponent,
@@ -1335,7 +1357,7 @@ final class VideoAnalysisPipeline {
                 NSLog("[MotionBERT] Releasing RTMPose and freeing memory…")
                 currentStage = .motionbert
                 t0 = CFAbsoluteTimeGetCurrent()
-                NSLog("[PIPELINE %s] MotionBERT → start", runID)
+                NSLog("[PIPELINE %@] MotionBERT → start", runID)
                 let motionSummary: MotionBERTSummary? = try autoreleasepool {
                     var analyzer: MotionBERTAnalyzer? = MotionBERTAnalyzer(config: self.config)
                     defer {
@@ -1346,28 +1368,28 @@ final class VideoAnalysisPipeline {
                 }
                 if let mb = motionSummary {
                     let elapsed = CFAbsoluteTimeGetCurrent() - t0
-                    NSLog("[PIPELINE %s] MotionBERT ← done frames=%d ok=%d (%.3fs)",
+                    NSLog("[PIPELINE %@] MotionBERT ← done frames=%d ok=%d (%.3fs)",
                           runID, mb.totals.framesProcessed, mb.totals.framesWith3D, elapsed)
                 } else {
-                    NSLog("[PIPELINE %s] MotionBERT ← skipped (no frames)", runID)
+                    NSLog("[PIPELINE %@] MotionBERT ← skipped (no frames)", runID)
                 }
 
                 completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary, postprocess: postprocessSummary, motionbert: motionSummary)))
-                NSLog("[PIPELINE %s] done (total=%.3fs)", runID, CFAbsoluteTimeGetCurrent() - startAll)
+                NSLog("[PIPELINE %@] done (total=%.3fs)", runID, CFAbsoluteTimeGetCurrent() - startAll)
             } catch let e as VideoAnalysisStageError {
-                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, e.stage.rawValue, e.localizedDescription)
+                NSLog("[PIPELINE %@] ERROR stage=%@ msg=%@", runID, e.stage.rawValue, e.localizedDescription)
                 completion(.failure(e))
             } catch let e as YOLOAnalysisError {
-                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.yolo.rawValue, e.localizedDescription)
+                NSLog("[PIPELINE %@] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.yolo.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: e)))
             } catch let e as RTMPoseError {
-                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.rtmpose.rawValue, e.localizedDescription)
+                NSLog("[PIPELINE %@] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.rtmpose.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: e)))
             } catch let e as MotionBERTError {
-                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.motionbert.rawValue, e.localizedDescription)
+                NSLog("[PIPELINE %@] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.motionbert.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .motionbert, underlying: e)))
             } catch {
-                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, currentStage.rawValue, error.localizedDescription)
+                NSLog("[PIPELINE %@] ERROR stage=%@ msg=%@", runID, currentStage.rawValue, error.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: currentStage, underlying: error)))
             }
         }

@@ -213,7 +213,7 @@ class _RtmposePainter extends CustomPainter {
     }
 
     final Size videoSize = Size(resolvedWidth, resolvedHeight);
-    final FittedSizes fitted = applyBoxFit(BoxFit.contain, videoSize, size);
+    final FittedSizes fitted = applyBoxFit(BoxFit.cover, videoSize, size);
     final Size destination = fitted.destination;
     final Offset padding = Offset(
       (size.width - destination.width) / 2,

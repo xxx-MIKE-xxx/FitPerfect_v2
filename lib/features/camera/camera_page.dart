@@ -22,7 +22,7 @@ class CameraPage extends StatefulWidget {
 
 class _CameraPageState extends State<CameraPage> {
   static const MethodChannel _analysisChannel = MethodChannel('fitperfect/analysis');
-  static const double _sampledFps = 5.0;
+  static const double _sampledFps = 10.0;
 
   CameraController? _cameraController;
   Future<void>? _initializeControllerFuture;

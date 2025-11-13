@@ -16,7 +16,7 @@
     "maxDetections": 200
   },
   "rtmpose": {
-    "rotationOverrideDeg": 180,
+    "rotationOverrideDeg": 0,
     "padding": 1.44,
     "inputWidth": 192,
     "inputHeight": 256,
