@@ -11,26 +11,6 @@ import UIKit
 private let YOLO_BBOX_MODE               = "xywh_tl"
 private let YOLO_COORDS_ORIGIN           = "top_left"
 
-// Python probe picked rot=180 for your clip.
-// Change to 0 if your next video is upright.
-private let RTMPOSE_ROTATION_DEGREES     = 180
-
-// Python probe preferred BGR normalization.
-// Switch to "RGB" if you verify otherwise.
-private let RTMPOSE_CHANNEL_ORDER        = "BGR"
-
-// 1.25 * 1.15 ≈ 1.44  (your “+15%” room for limbs)
-private let RTMPOSE_DEFAULT_PADDING      = 1.44
-
-// RTMPose input + SIMCC
-private let RTMPOSE_INPUT_W              = 192
-private let RTMPOSE_INPUT_H              = 256
-private let RTMPOSE_SIMCC_RATIO: Double  = 2.0
-
-// ImageNet stats (OpenMMLab)
-private let RTMPOSE_MEANS: [Float]       = [123.675, 116.28, 103.53]
-private let RTMPOSE_STDS:  [Float]       = [58.395, 57.12, 57.375]
-
 // =====================================================
 // MARK: – YOLO stage types
 // =====================================================
@@ -56,6 +36,7 @@ struct YOLOFrameSelection: Codable {
 }
 
 struct YOLODetectionFrame: Codable {
+    let fi: Int
     let t: Double
     let boxes: [YOLODetectionBox]
     let selected: YOLOFrameSelection?
@@ -106,9 +87,11 @@ enum YOLOAnalysisError: Error {
 // =====================================================
 
 final class VideoYOLOAnalyzer {
+    private let config: PipelineConfig
+    private let yoloConfig: PipelineConfig.YOLO
     private var asset: AVAsset?
     private var track: AVAssetTrack?
-    private var model: YOLOv3Tiny?
+    private var model: MLModel?
     private var visionModel: VNCoreMLModel?
     private var generator: AVAssetImageGenerator?
     private let personStrategy: PersonSelectionStrategy
@@ -126,9 +109,11 @@ final class VideoYOLOAnalyzer {
         "teddy bear","hair drier","toothbrush"
     ]
 
-    init(personStrategy: PersonSelectionStrategy = .bestScore) {
+    init(config: PipelineConfig, personStrategy: PersonSelectionStrategy = .bestScore) {
+        self.config = config
+        self.yoloConfig = config.yolo
         self.personStrategy = personStrategy
-        self.frameRotation = normalizedRotation(RTMPOSE_ROTATION_DEGREES)
+        self.frameRotation = normalizedRotation(config.yolo.rotationCorrectionDeg)
     }
 
     func analyze(
@@ -147,11 +132,12 @@ final class VideoYOLOAnalyzer {
 
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .all
-        guard let yoloModel = try? YOLOv3Tiny(configuration: configuration) else {
+        guard let modelURL = Bundle.main.url(forResource: "best", withExtension: "mlpackage") else {
             throw YOLOAnalysisError.modelUnavailable
         }
+        let yoloModel = try MLModel.load(contentsOf: modelURL, configuration: configuration)
         model = yoloModel
-        visionModel = try VNCoreMLModel(for: yoloModel.model)
+        visionModel = try VNCoreMLModel(for: yoloModel)
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -166,25 +152,34 @@ final class VideoYOLOAnalyzer {
         let fps = track.nominalFrameRate > 0 ? Double(track.nominalFrameRate) : estimateFrameRate(for: track)
         let durationSeconds = CMTimeGetSeconds(asset.duration)
 
-        let effectiveSampledFps = max(sampledFps, 1.0)
-        let samplingStep = 1.0 / effectiveSampledFps
+        let targetSampledFps = max(sampledFps, 1.0)
+        let baseFps = fps > 0 ? fps : 30.0
+        let frameStep = max(1, Int(round(baseFps / targetSampledFps)))
+        let effectiveSampledFps = baseFps / Double(frameStep)
+        let frameDuration = 1.0 / baseFps
 
         var frames: [YOLODetectionFrame] = []
         var totalDetections = 0
 
-        var currentTime = 0.0
         let timeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
 
         let rotation = frameRotation
 
-        while currentTime < durationSeconds {
+        var sampleIndex = 0
+        while true {
+            let fi = sampleIndex * frameStep
+            let timestamp = Double(fi) * frameDuration
+            if timestamp > durationSeconds + frameDuration * 0.5 {
+                break
+            }
             autoreleasepool {
-                let time = CMTime(seconds: currentTime, preferredTimescale: timeScale)
+                let time = CMTime(seconds: timestamp, preferredTimescale: timeScale)
                 if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
                     let uprightImage = self.rotateForYOLOIfNeeded(cgImage, rotation: rotation)
                     let frame = self.processFrame(
                         cgImage: uprightImage,
-                        timestamp: currentTime,
+                        frameIndex: fi,
+                        timestamp: timestamp,
                         videoWidth: videoWidth,
                         videoHeight: videoHeight,
                         rotation: rotation
@@ -194,24 +189,25 @@ final class VideoYOLOAnalyzer {
                 } else {
                     // *** FIX: always include `selected` ***
                     let emptyFrame = YOLODetectionFrame(
-                        t: round(currentTime * 100) / 100,
+                        fi: fi,
+                        t: round(timestamp * 100) / 100,
                         boxes: [],
                         selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
                     )
                     frames.append(emptyFrame)
                 }
             }
-            currentTime += samplingStep
+            sampleIndex += 1
         }
 
         let totals = YOLODetectionTotals(framesProcessed: frames.count, detections: totalDetections)
 
         // Store meta so RTMPose can mirror what we used in Python
         let meta = YOLODetectionMeta(
-            bboxMode: YOLO_BBOX_MODE,
-            coordsOrigin: YOLO_COORDS_ORIGIN,
+            bboxMode: yoloConfig.bboxMode,
+            coordsOrigin: yoloConfig.coordsOrigin,
             rotationCorrectionDeg: frameRotation,
-            channelOrder: RTMPOSE_CHANNEL_ORDER
+            channelOrder: config.rtmpose.channelOrder
         )
 
         let output = YOLODetectionOutput(
@@ -261,6 +257,7 @@ final class VideoYOLOAnalyzer {
 
     private func processFrame(
         cgImage: CGImage,
+        frameIndex: Int,
         timestamp: Double,
         videoWidth: Int,
         videoHeight: Int,
@@ -268,6 +265,7 @@ final class VideoYOLOAnalyzer {
     ) -> YOLODetectionFrame {
         guard let visionModel = visionModel else {
             return YOLODetectionFrame(
+                fi: frameIndex,
                 t: round(timestamp * 100) / 100,
                 boxes: [],
                 selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
@@ -283,6 +281,7 @@ final class VideoYOLOAnalyzer {
             guard let observations = request.results as? [VNRecognizedObjectObservation] else {
                 // *** FIX: always include `selected` ***
                 return YOLODetectionFrame(
+                    fi: frameIndex,
                     t: round(timestamp * 100) / 100,
                     boxes: [],
                     selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
@@ -332,12 +331,14 @@ final class VideoYOLOAnalyzer {
             let selection = YOLOFrameSelection(strategy: personStrategy.rawValue, index: selectedIndex)
 
             return YOLODetectionFrame(
+                fi: frameIndex,
                 t: round(timestamp * 100) / 100,
                 boxes: boxes,
                 selected: selection
             )
         } catch {
             return YOLODetectionFrame(
+                fi: frameIndex,
                 t: round(timestamp * 100) / 100,
                 boxes: [],
                 selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
@@ -397,6 +398,7 @@ struct RTMPoseKeypoint: Codable {
 }
 
 struct RTMPoseFrame: Codable {
+    let fi: Int
     let t: Double
     let ok: Bool
     let keypoints: [RTMPoseKeypoint]
@@ -446,9 +448,17 @@ struct RTMPoseSummary {
 // =====================================================
 
 final class RTMPoseAnalyzer {
+    private let config: PipelineConfig
+    private let poseConfig: PipelineConfig.RTMPose
     private let paddingFactor: Double
     private let personStrategy: PersonSelectionStrategy
     private let rotationOverrideDegrees: Int
+    private let inputWidth: Int
+    private let inputHeight: Int
+    private let simccRatio: Double
+    private let means: [Float]
+    private let stds: [Float]
+    private let minKeypointScore: Double
 
     private var model: RTMPose?
     private var asset: AVAsset?
@@ -461,14 +471,18 @@ final class RTMPoseAnalyzer {
         (11, 13), (13, 15), (12, 14), (14, 16), (5, 1), (6, 2), (1, 3), (2, 4)
     ]
 
-    init(
-        paddingFactor: Double = RTMPOSE_DEFAULT_PADDING,
-        personStrategy: PersonSelectionStrategy = .bestScore,
-        rotationOverrideDegrees: Int = RTMPOSE_ROTATION_DEGREES
-    ) {
-        self.paddingFactor = paddingFactor
+    init(config: PipelineConfig, personStrategy: PersonSelectionStrategy = .bestScore) {
+        self.config = config
+        self.poseConfig = config.rtmpose
+        self.paddingFactor = config.rtmpose.padding
         self.personStrategy = personStrategy
-        self.rotationOverrideDegrees = rotationOverrideDegrees
+        self.rotationOverrideDegrees = config.rtmpose.rotationOverrideDeg
+        self.inputWidth = config.rtmpose.inputWidth
+        self.inputHeight = config.rtmpose.inputHeight
+        self.simccRatio = config.rtmpose.simccRatio
+        self.means = config.rtmpose.means.map { Float($0) }
+        self.stds = config.rtmpose.stds.map { Float($0) }
+        self.minKeypointScore = config.rtmpose.minKeypointScore
     }
 
     func analyze(
@@ -514,20 +528,20 @@ final class RTMPoseAnalyzer {
 
         // Log once at the start so you can tweak quickly
         NSLog("[RTMPose] input=%dx%d simccRatio=%.1f padding=%.2f rotation=%d channelOrder=%@",
-              RTMPOSE_INPUT_W, RTMPOSE_INPUT_H, RTMPOSE_SIMCC_RATIO,
-              paddingFactor, effectiveRotation, RTMPOSE_CHANNEL_ORDER)
+              inputWidth, inputHeight, simccRatio,
+              paddingFactor, effectiveRotation, poseConfig.channelOrder)
 
         for fr in yolo.frames {
             autoreleasepool {
                 let hint = fr.selected?.index ?? -1
                 guard let box = self.pickPerson(fr.boxes, hint: hint) else {
-                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: []))
+                    frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: false, keypoints: []))
                     return
                 }
 
                 let time = CMTime(seconds: fr.t, preferredTimescale: timeScale)
                 guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
-                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: [])); return
+                    frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: false, keypoints: [])); return
                 }
 
                 guard
@@ -540,7 +554,7 @@ final class RTMPoseAnalyzer {
                     ),
                     let out = try? self.predict(prep.array)
                 else {
-                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: [])); return
+                    frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: false, keypoints: [])); return
                 }
 
                 let kps = self.decode(out, cropRect: prep.cropRect,
@@ -554,15 +568,16 @@ final class RTMPoseAnalyzer {
                 }
 
                 if kps.isEmpty {
-                    frames.append(RTMPoseFrame(t: fr.t, ok: false, keypoints: []))
+                    frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: false, keypoints: []))
                     return
                 }
 
                 maxK = max(maxK, kps.count)
-                frames.append(RTMPoseFrame(t: fr.t, ok: true, keypoints: kps))
-                framesWithDetections += 1
+                let isStrong = kps.contains { $0.score >= minKeypointScore }
+                frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: isStrong, keypoints: kps))
+                if isStrong { framesWithDetections += 1 }
 
-                if previewURL == nil, let p = try? self.renderPreview(baseImage: cgImage, keypoints: kps, outputURL: previewOutputURL) {
+                if isStrong, previewURL == nil, let p = try? self.renderPreview(baseImage: cgImage, keypoints: kps, outputURL: previewOutputURL) {
                     previewURL = p
                 }
             }
@@ -576,8 +591,8 @@ final class RTMPoseAnalyzer {
             fps: yolo.fps,
             sampledFps: yolo.sampledFps,
             numKeypoints: maxK,
-            simccRatio: RTMPOSE_SIMCC_RATIO,
-            inputSize: .init(w: RTMPOSE_INPUT_W, h: RTMPOSE_INPUT_H),
+            simccRatio: simccRatio,
+            inputSize: .init(w: inputWidth, h: inputHeight),
             frames: frames,
             totals: totals,
             debug: lastSimccShapes.map { RTMPoseJSONOutput.Debug(simccXShape: $0.0, simccYShape: $0.1) }
@@ -590,7 +605,7 @@ final class RTMPoseAnalyzer {
         NSLog("[RTMPose] frames=%d ok=%d  (meta rot=%d, used rot=%d, chan=%@, pad=%.2f)",
               totals.framesProcessed, totals.framesWithDetections,
               yolo.meta?.rotationCorrectionDeg ?? 0, effectiveRotation,
-              RTMPOSE_CHANNEL_ORDER, paddingFactor)
+              poseConfig.channelOrder, paddingFactor)
 
         return RTMPoseSummary(jsonURL: poseJSONURL, previewURL: previewURL, totals: totals, numKeypoints: maxK)
     }
@@ -642,22 +657,22 @@ final class RTMPoseAnalyzer {
         }
 
         // Draw into BGRA buffer at model input size
-        var pixels = [UInt8](repeating: 0, count: RTMPOSE_INPUT_W * RTMPOSE_INPUT_H * 4)
+        var pixels = [UInt8](repeating: 0, count: inputWidth * inputHeight * 4)
         let cs = CGColorSpaceCreateDeviceRGB()
-        let bytesPerRow = RTMPOSE_INPUT_W * 4
+        let bytesPerRow = inputWidth * 4
         let bmpInfo: CGBitmapInfo = [ .byteOrder32Little,
                                       CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue) ]
         guard let ctx = CGContext(
             data: &pixels,
-            width: RTMPOSE_INPUT_W, height: RTMPOSE_INPUT_H,
+            width: inputWidth, height: inputHeight,
             bitsPerComponent: 8, bytesPerRow: bytesPerRow,
             space: cs, bitmapInfo: bmpInfo.rawValue
         ) else { return nil }
         ctx.interpolationQuality = .high
-        ctx.draw(rotated, in: CGRect(x: 0, y: 0, width: RTMPOSE_INPUT_W, height: RTMPOSE_INPUT_H))
+        ctx.draw(rotated, in: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight))
 
         // Build 1x3xH×W in the requested channel order (BGR or RGB)
-        let N = RTMPOSE_INPUT_W * RTMPOSE_INPUT_H
+        let N = inputWidth * inputHeight
         var floats = [Float](repeating: 0, count: N * 3)
 
         for i in 0..<N {
@@ -667,20 +682,20 @@ final class RTMPoseAnalyzer {
             let g = Float(pixels[p + 1])
             let r = Float(pixels[p + 2])
 
-            if RTMPOSE_CHANNEL_ORDER.uppercased() == "BGR" {
+            if poseConfig.channelOrder.uppercased() == "BGR" {
                 // Channel 0 ← B, 1 ← G, 2 ← R  (means/stds applied in this order)
-                floats[i]          = (b - RTMPOSE_MEANS[0]) / RTMPOSE_STDS[0]
-                floats[N + i]      = (g - RTMPOSE_MEANS[1]) / RTMPOSE_STDS[1]
-                floats[2 * N + i]  = (r - RTMPOSE_MEANS[2]) / RTMPOSE_STDS[2]
+                floats[i]          = (b - means[0]) / stds[0]
+                floats[N + i]      = (g - means[1]) / stds[1]
+                floats[2 * N + i]  = (r - means[2]) / stds[2]
             } else {
                 // Channel 0 ← R, 1 ← G, 2 ← B
-                floats[i]          = (r - RTMPOSE_MEANS[0]) / RTMPOSE_STDS[0]
-                floats[N + i]      = (g - RTMPOSE_MEANS[1]) / RTMPOSE_STDS[1]
-                floats[2 * N + i]  = (b - RTMPOSE_MEANS[2]) / RTMPOSE_STDS[2]
+                floats[i]          = (r - means[0]) / stds[0]
+                floats[N + i]      = (g - means[1]) / stds[1]
+                floats[2 * N + i]  = (b - means[2]) / stds[2]
             }
         }
 
-        let shape: [NSNumber] = [1, 3, NSNumber(value: RTMPOSE_INPUT_H), NSNumber(value: RTMPOSE_INPUT_W)]
+        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
         guard let arr = try? MLMultiArray(shape: shape, dataType: .float32) else { return nil }
         floats.withUnsafeBytes { buf in
             memcpy(arr.dataPointer, buf.baseAddress!, floats.count * MemoryLayout<Float>.size)
@@ -771,13 +786,13 @@ final class RTMPoseAnalyzer {
         let swapAxes = (rotation == 90 || rotation == 270)
         let cropW = Double(cropRect.width), cropH = Double(cropRect.height)
         let rotW = swapAxes ? cropH : cropW, rotH = swapAxes ? cropW : cropH
-        let scaleX = rotW / Double(RTMPOSE_INPUT_W)
-        let scaleY = rotH / Double(RTMPOSE_INPUT_H)
+        let scaleX = rotW / Double(inputWidth)
+        let scaleY = rotH / Double(inputHeight)
 
         var out: [RTMPoseKeypoint] = []; out.reserveCapacity(K)
         for k in 0..<K {
-            let xf = Double(ix[k]) / RTMPOSE_SIMCC_RATIO
-            let yf = Double(iy[k]) / RTMPOSE_SIMCC_RATIO
+            let xf = Double(ix[k]) / simccRatio
+            let yf = Double(iy[k]) / simccRatio
             let xr = xf * scaleX
             let yr = yf * scaleY
             let p = rotatePoint(x: xr, y: yr, rotation: rotation, cropW: cropW, cropH: cropH)
@@ -849,10 +864,6 @@ final class RTMPoseAnalyzer {
 // MARK: – MotionBERT-Lite (2D → 3D lifting)
 // =====================================================
 
-private let MOTIONBERT_TEMPORAL = 243
-private let MOTIONBERT_CENTER = 121
-private let MOTIONBERT_HEAD_TOP_FACTOR: Double = 0.6
-
 enum MotionBERTError: Error {
     case poseJSONUnavailable
     case modelResourceMissing
@@ -867,6 +878,7 @@ struct MotionBERTKeypoint3D: Codable {
 }
 
 struct MotionBERTFrameOutput: Codable {
+    let fi: Int
     let t: Double
     let ok: Bool
     let keypoints3d: [MotionBERTKeypoint3D]
@@ -903,6 +915,11 @@ struct MotionBERTSummary {
 }
 
 final class MotionBERTAnalyzer {
+    private let config: PipelineConfig
+    private let motionConfig: PipelineConfig.MotionBERT
+    private let temporalWindow: Int
+    private let windowCenter: Int
+    private let stride: Int
     private struct Joint2D {
         let x: Double
         let y: Double
@@ -910,28 +927,27 @@ final class MotionBERTAnalyzer {
     }
 
     private struct Frame2D {
+        let index: Int
         let timestamp: Double
         let joints: [Joint2D]
     }
 
     private var model: MLModel?
 
-    func analyze(sessionDirectory: String, poseSummary: RTMPoseSummary) throws -> MotionBERTSummary? {
-        guard let poseData = try? Data(contentsOf: poseSummary.jsonURL) else {
-            throw MotionBERTError.poseJSONUnavailable
-        }
+    init(config: PipelineConfig) {
+        self.config = config
+        self.motionConfig = config.motionbert
+        self.temporalWindow = max(1, config.motionbert.temporalWindow)
+        self.windowCenter = min(max(config.motionbert.center, 0), max(0, self.temporalWindow - 1))
+        self.stride = max(1, config.motionbert.stride)
+    }
 
-        let decoder = JSONDecoder()
-        let poseOutput: RTMPoseJSONOutput
-        do {
-            poseOutput = try decoder.decode(RTMPoseJSONOutput.self, from: poseData)
-        } catch {
-            throw MotionBERTError.poseJSONUnavailable
-        }
+    func analyze(sessionDirectory: String, postprocessResult: Postprocess2DResult) throws -> MotionBERTSummary? {
+        let normalized = postprocessResult.normalizedOutput
 
-        NSLog("[MotionBERT] F=243, H36M-17, input=(x,y,conf) from RTMPose pixels; window=center=121")
+        NSLog("[MotionBERT] window=%d stride=%d skeleton=%@", temporalWindow, stride, motionConfig.skeleton)
 
-        let frames2D = prepareFrames(from: poseOutput.frames)
+        let frames2D = prepareFrames(from: normalized.frames)
         let frameCount = frames2D.count
         if frameCount == 0 {
             NSLog("[MotionBERT] No RTMPose frames found; skipping MotionBERT stage.")
@@ -960,9 +976,9 @@ final class MotionBERTAnalyzer {
         var outputs: [MotionBERTFrameOutput] = []
         outputs.reserveCapacity(frameCount)
 
-        if frameCount <= MOTIONBERT_TEMPORAL {
-            let padLeft = (MOTIONBERT_TEMPORAL - frameCount) / 2
-            let padRight = MOTIONBERT_TEMPORAL - frameCount - padLeft
+        if frameCount <= temporalWindow {
+            let padLeft = (temporalWindow - frameCount) / 2
+            let padRight = temporalWindow - frameCount - padLeft
             let first = frames2D.first!
             let last = frames2D.last!
             let padded = Array(repeating: first, count: padLeft) + frames2D + Array(repeating: last, count: padRight)
@@ -973,37 +989,39 @@ final class MotionBERTAnalyzer {
             for (index, frame) in frames2D.enumerated() {
                 let timeIndex = padLeft + index
                 let joints3d = extractFrame(from: prediction, timeIndex: timeIndex)
-                outputs.append(MotionBERTFrameOutput(t: frame.timestamp, ok: true, keypoints3d: joints3d))
+                outputs.append(MotionBERTFrameOutput(fi: frame.index, t: frame.timestamp, ok: true, keypoints3d: joints3d))
             }
             framesWith3D = frameCount
         } else {
-            for i in 0..<frameCount {
+            var i = 0
+            while i < frameCount {
                 let prediction: MLMultiArray = try autoreleasepool {
                     let window = makeWindow(around: i, frames: frames2D)
                     return try self.predict(window: window)
                 }
-                let joints3d = self.extractFrame(from: prediction, timeIndex: MOTIONBERT_CENTER)
-                outputs.append(MotionBERTFrameOutput(t: frames2D[i].timestamp, ok: true, keypoints3d: joints3d))
+                let joints3d = self.extractFrame(from: prediction, timeIndex: windowCenter)
+                outputs.append(MotionBERTFrameOutput(fi: frames2D[i].index, t: frames2D[i].timestamp, ok: true, keypoints3d: joints3d))
                 framesWith3D += 1
+                i += stride
             }
         }
 
         let totals = MotionBERTTotals(framesProcessed: frameCount, framesWith3D: framesWith3D)
 
         let jsonOutput = MotionBERTJSONOutput(
-            videoWidth: poseOutput.videoWidth,
-            videoHeight: poseOutput.videoHeight,
-            fps: poseOutput.fps,
-            sampledFps: poseOutput.sampledFps,
-            temporalWindow: MOTIONBERT_TEMPORAL,
-            skeleton: "H36M-17",
+            videoWidth: normalized.videoWidth,
+            videoHeight: normalized.videoHeight,
+            fps: normalized.fps,
+            sampledFps: normalized.sampledFps,
+            temporalWindow: temporalWindow,
+            skeleton: motionConfig.skeleton,
             frames: outputs,
             totals: totals,
             debug: .init(
-                inputShape: [1, MOTIONBERT_TEMPORAL, 17, 3],
-                outputShape: [1, MOTIONBERT_TEMPORAL, 17, 3],
-                mapping: "COCO17->H36M17, HEAD_TOP_FACTOR=0.6, spine=mid(pelvis,neck)",
-                windowing: "center=121, pad=repeat"
+                inputShape: [1, temporalWindow, 17, 3],
+                outputShape: [1, temporalWindow, 17, 3],
+                mapping: "postprocess_2d:h36m_normalized",
+                windowing: "center=\(windowCenter), stride=\(stride)"
             )
         )
 
@@ -1022,117 +1040,30 @@ final class MotionBERTAnalyzer {
 
     // MARK: – Helpers
 
-    private func prepareFrames(from frames: [RTMPoseFrame]) -> [Frame2D] {
+    private func prepareFrames(from frames: [H36MNormalizedFrame]) -> [Frame2D] {
         var prepared: [Frame2D] = []
         prepared.reserveCapacity(frames.count)
 
-        var lastKnown: [Joint2D?] = Array(repeating: nil, count: 17)
-        let counterpart: [Int: Int] = [
-            1: 2, 2: 1,
-            3: 4, 4: 3,
-            5: 6, 6: 5,
-            7: 8, 8: 7,
-            9: 10, 10: 9,
-            11: 12, 12: 11,
-            13: 14, 14: 13,
-            15: 16, 16: 15
-        ]
-
         for frame in frames {
-            var coco: [Joint2D] = []
-            coco.reserveCapacity(17)
-
-            for index in 0..<17 {
-                var joint: Joint2D?
-
-                if frame.ok, index < frame.keypoints.count {
-                    let kp = frame.keypoints[index]
-                    if kp.score > 0 {
-                        joint = Joint2D(x: kp.x, y: kp.y, score: kp.score)
-                    }
-                }
-
-                if joint == nil, let previous = lastKnown[index] {
-                    joint = previous
-                }
-
-                if joint == nil, let mirrorIndex = counterpart[index] {
-                    if frame.ok, mirrorIndex < frame.keypoints.count {
-                        let mirror = frame.keypoints[mirrorIndex]
-                        if mirror.score > 0 {
-                            joint = Joint2D(x: mirror.x, y: mirror.y, score: mirror.score)
-                        }
-                    }
-                    if joint == nil, let lastMirror = lastKnown[mirrorIndex] {
-                        joint = lastMirror
-                    }
-                }
-
-                if joint == nil {
-                    joint = Joint2D(x: 0, y: 0, score: 0)
-                }
-
-                let resolved = joint!
-                lastKnown[index] = resolved
-                coco.append(resolved)
+            let joints: [Joint2D] = frame.keypoints.map { values in
+                let x = values.count > 0 ? values[0] : 0
+                let y = values.count > 1 ? values[1] : 0
+                let s = values.count > 2 ? values[2] : 0
+                return Joint2D(x: x, y: y, score: s)
             }
-
-            prepared.append(Frame2D(timestamp: frame.t, joints: convertToH36M(from: coco)))
+            prepared.append(Frame2D(index: frame.fi, timestamp: frame.t, joints: joints))
         }
 
         return prepared
     }
 
-    private func convertToH36M(from coco: [Joint2D]) -> [Joint2D] {
-        func midpoint(_ a: Joint2D, _ b: Joint2D) -> Joint2D {
-            Joint2D(
-                x: (a.x + b.x) / 2.0,
-                y: (a.y + b.y) / 2.0,
-                score: min(a.score, b.score)
-            )
-        }
-
-        let lHip = coco[11]
-        let rHip = coco[12]
-        let pelvis = midpoint(lHip, rHip)
-        let neck = midpoint(coco[5], coco[6])
-        let torso = midpoint(pelvis, neck)
-        let nose = coco[0]
-
-        let headTop = Joint2D(
-            x: nose.x + MOTIONBERT_HEAD_TOP_FACTOR * (nose.x - neck.x),
-            y: nose.y + MOTIONBERT_HEAD_TOP_FACTOR * (nose.y - neck.y),
-            score: nose.score
-        )
-
-        return [
-            pelvis,
-            rHip,
-            coco[14],
-            coco[16],
-            lHip,
-            coco[13],
-            coco[15],
-            torso,
-            neck,
-            nose,
-            headTop,
-            coco[5],
-            coco[7],
-            coco[9],
-            coco[6],
-            coco[8],
-            coco[10]
-        ]
-    }
-
     private func makeWindow(around index: Int, frames: [Frame2D]) -> [Frame2D] {
         var window: [Frame2D] = []
-        window.reserveCapacity(MOTIONBERT_TEMPORAL)
+        window.reserveCapacity(temporalWindow)
 
         let total = frames.count
-        for offset in 0..<MOTIONBERT_TEMPORAL {
-            let idx = min(max(index - MOTIONBERT_CENTER + offset, 0), total - 1)
+        for offset in 0..<temporalWindow {
+            let idx = min(max(index - windowCenter + offset, 0), total - 1)
             window.append(frames[idx])
         }
         return window
@@ -1141,7 +1072,7 @@ final class MotionBERTAnalyzer {
     private func predict(window: [Frame2D]) throws -> MLMultiArray {
         guard let model = model else { throw MotionBERTError.modelUnavailable }
 
-        let shape = [1, MOTIONBERT_TEMPORAL, 17, 3].map { NSNumber(value: $0) }
+        let shape = [1, temporalWindow, 17, 3].map { NSNumber(value: $0) }
         let input = try MLMultiArray(shape: shape, dataType: .float32)
         fill(input: input, with: window)
 
@@ -1201,11 +1132,24 @@ struct VideoAnalysisStageError: Error, LocalizedError {
 struct VideoAnalysisResult {
     let yolo: YOLOAnalysisSummary
     let rtmpose: RTMPoseSummary
+    let postprocess: Postprocess2DSummary
     let motionbert: MotionBERTSummary?
 }
 
 final class VideoAnalysisPipeline {
-    private let queue = DispatchQueue(label: "com.fitperfect.analysis", qos: .userInitiated)
+    private let config: PipelineConfig
+    private let queue: DispatchQueue
+    private let semaphore: DispatchSemaphore
+
+    init(config: PipelineConfig) {
+        self.config = config
+        self.queue = DispatchQueue(
+            label: config.runtime.dispatchQueueLabel,
+            qos: .userInitiated,
+            attributes: .concurrent
+        )
+        self.semaphore = DispatchSemaphore(value: max(1, config.runtime.maxConcurrentRuns))
+    }
 
     func run(
         videoPath: String,
@@ -1215,11 +1159,13 @@ final class VideoAnalysisPipeline {
         progress: ((String) -> Void)?,
         completion: @escaping (Result<VideoAnalysisResult, VideoAnalysisStageError>) -> Void
     ) {
+        semaphore.wait()
         queue.async {
+            defer { self.semaphore.signal() }
             do {
                 progress?("Running YOLO…")
                 let yoloSummary: YOLOAnalysisSummary = try autoreleasepool {
-                    let a = VideoYOLOAnalyzer(personStrategy: personStrategy)
+                    let a = VideoYOLOAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer { a.teardown() }
                     return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, sampledFps: sampledFps)
                 }
@@ -1227,7 +1173,7 @@ final class VideoAnalysisPipeline {
 
                 progress?("Running RTMPose…")
                 let poseSummary: RTMPoseSummary = try autoreleasepool {
-                    var analyzer: RTMPoseAnalyzer? = RTMPoseAnalyzer(personStrategy: personStrategy)
+                    var analyzer: RTMPoseAnalyzer? = RTMPoseAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer {
                         analyzer?.teardown()
                         analyzer = nil
@@ -1236,18 +1182,39 @@ final class VideoAnalysisPipeline {
                 }
                 NSLog("RTMPose stage complete. frames=%d ok=%d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
 
+                progress?("Refining 2D keypoints…")
+                let postprocessResult: Postprocess2DResult = try autoreleasepool {
+                    let processor = PosePostprocessor(
+                        config: self.config.postprocess,
+                        headTopFactor: self.config.motionbert.headTopFactor,
+                        skeletonName: self.config.motionbert.skeleton
+                    )
+                    let poseData = try Data(contentsOf: poseSummary.jsonURL)
+                    let decoded = try JSONDecoder().decode(RTMPoseJSONOutput.self, from: poseData)
+                    return try processor.run(poseOutput: decoded, sessionDirectory: sessionDirectory)
+                }
+
+                let postprocessSummary = Postprocess2DSummary(
+                    refinedURL: postprocessResult.refinedJSONURL,
+                    normalizedURL: postprocessResult.normalizedJSONURL,
+                    totals: postprocessResult.refinedOutput.totals,
+                    fps: postprocessResult.refinedOutput.fps,
+                    sampledFps: postprocessResult.refinedOutput.sampledFps,
+                    numKeypoints: postprocessResult.refinedOutput.numKeypoints
+                )
+
                 progress?("Running MotionBERT…")
                 NSLog("[MotionBERT] Releasing RTMPose and freeing memory…")
                 let motionSummary: MotionBERTSummary? = try autoreleasepool {
-                    var analyzer: MotionBERTAnalyzer? = MotionBERTAnalyzer()
+                    var analyzer: MotionBERTAnalyzer? = MotionBERTAnalyzer(config: self.config)
                     defer {
                         analyzer?.teardown()
                         analyzer = nil
                     }
-                    return try analyzer?.analyze(sessionDirectory: sessionDirectory, poseSummary: poseSummary)
+                    return try analyzer?.analyze(sessionDirectory: sessionDirectory, postprocessResult: postprocessResult)
                 }
 
-                completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary, motionbert: motionSummary)))
+                completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary, postprocess: postprocessSummary, motionbert: motionSummary)))
             } catch let e as VideoAnalysisStageError {
                 completion(.failure(e))
             } catch let e as YOLOAnalysisError {

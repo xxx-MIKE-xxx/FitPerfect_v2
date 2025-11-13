@@ -3,7 +3,14 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
-  private let pipeline = VideoAnalysisPipeline()
+  private let pipeline: VideoAnalysisPipeline = {
+    do {
+      let config = try PipelineConfig.load()
+      return VideoAnalysisPipeline(config: config)
+    } catch {
+      fatalError("Failed to load pipeline configuration: \(error)")
+    }
+  }()
 
   override func application(
     _ application: UIApplication,
@@ -60,6 +67,17 @@ import UIKit
                   poseInfo["previewPath"] = preview.path
                 }
 
+                let post = summary.postprocess
+                var postInfo: [String: Any] = [
+                  "frames": post.totals.framesProcessed,
+                  "framesWithDetections": post.totals.framesWithDetections,
+                  "refinedPath": post.refinedURL.path,
+                  "normalizedPath": post.normalizedURL.path,
+                  "numKeypoints": post.numKeypoints
+                ]
+                postInfo["fps"] = post.fps
+                postInfo["sampledFps"] = post.sampledFps
+
                 var motionInfo: [String: Any]?
                 if let motion = summary.motionbert {
                   var info: [String: Any] = [
@@ -80,7 +98,8 @@ import UIKit
                     "detections": summary.yolo.totals.detections,
                     "jsonPath": summary.yolo.jsonURL.path
                   ],
-                  "rtmpose": poseInfo
+                  "rtmpose": poseInfo,
+                  "postprocess": postInfo
                 ]
                 if let motionInfo = motionInfo {
                   response["motionbert"] = motionInfo

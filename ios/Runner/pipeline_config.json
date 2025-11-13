@@ -1,0 +1,61 @@
+{
+  "runtime": {
+    "dispatchQueueLabel": "com.fitperfect.analysis",
+    "maxConcurrentRuns": 4
+  },
+  "yolo": {
+    "bboxMode": "xywh_tl",
+    "coordsOrigin": "top_left",
+    "rotationCorrectionDeg": 0,
+    "channelOrder": "RGB",
+    "imgsz": 640,
+    "stride": 32,
+    "padColor": [114, 114, 114],
+    "scoreThreshold": 0.25,
+    "nmsThreshold": 0.45,
+    "maxDetections": 200
+  },
+  "rtmpose": {
+    "rotationOverrideDeg": 180,
+    "padding": 1.44,
+    "inputWidth": 192,
+    "inputHeight": 256,
+    "simccRatio": 2.0,
+    "means": [123.675, 116.28, 103.53],
+    "stds": [58.395, 57.12, 57.375],
+    "minKeypointScore": 0.0,
+    "personSelection": "bestScore",
+    "channelOrder": "BGR"
+  },
+  "postprocess": {
+    "ema": {
+      "enabled": true,
+      "alpha": 0.4
+    },
+    "confidence": {
+      "min": 0.05,
+      "floor": 0.01
+    },
+    "gapFill": {
+      "maxInterpolatedGap": 5
+    },
+    "globalMotion": {
+      "enabled": true,
+      "window": 5
+    },
+    "normalize": {
+      "enabled": true,
+      "rootJoint": 0,
+      "scaleJointA": 8,
+      "scaleJointB": 11,
+      "epsilon": 1e-6
+    }
+  },
+  "motionbert": {
+    "temporalWindow": 243,
+    "center": 121,
+    "stride": 1,
+    "headTopFactor": 0.6,
+    "skeleton": "h36m17"
+  }
+}
