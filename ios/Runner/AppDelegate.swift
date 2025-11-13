@@ -3,14 +3,20 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
-  private let pipeline: VideoAnalysisPipeline = {
+  private let pipelineConfig: PipelineConfig = {
     do {
-      let config = try PipelineConfig.load()
-      return VideoAnalysisPipeline(config: config)
+      return try PipelineConfig.load()
     } catch {
       fatalError("Failed to load pipeline configuration: \(error)")
     }
   }()
+
+  private lazy var pipeline: VideoAnalysisPipeline = {
+    VideoAnalysisPipeline(config: pipelineConfig)
+  }()
+
+  private var shouldLogBridgeArgumentKeys = true
+  private var shouldLogBridgeResultKeys = true
 
   override func application(
     _ application: UIApplication,
@@ -25,6 +31,11 @@ import UIKit
       )
 
       channel.setMethodCallHandler { [weak self] call, result in
+        guard let self = self else {
+          result(FlutterError(code: "app_delegate_missing", message: "AppDelegate unavailable", details: nil))
+          return
+        }
+
         guard call.method == "runVideoAnalysis" else {
           result(FlutterMethodNotImplemented)
           return
@@ -39,12 +50,33 @@ import UIKit
           return
         }
 
+        logKeysOnce(arguments, tag: "BRIDGE_ARGS", onlyOnce: &self.shouldLogBridgeArgumentKeys)
+
         let sampledFps = (arguments["sampledFps"] as? Double) ?? 3.0
         let personStrategyString = (arguments["person"] as? String) ?? PersonSelectionStrategy.bestScore.rawValue
         let personStrategy = PersonSelectionStrategy(rawValue: personStrategyString) ?? .bestScore
 
-        self?.pipeline.run(
-          videoPath: videoPath,
+        let rawPath = videoPath
+        let videoURL: URL = rawPath.hasPrefix("file://") ? URL(string: rawPath)! : URL(fileURLWithPath: rawPath)
+        let normalizedPath = videoURL.isFileURL ? videoURL.path : rawPath
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: normalizedPath, isDirectory: &isDir)
+        NSLog("[BRIDGE] analyze request: raw=%@ normalized=%@ exists=%d dir=%d cfg_verbose=%d",
+              rawPath,
+              normalizedPath,
+              exists ? 1 : 0,
+              isDir.boolValue ? 1 : 0,
+              self.pipeline.debugConfig.verboseLogging ? 1 : 0)
+
+        guard exists, !isDir.boolValue else {
+          result(["ok": false, "stage": "bridge", "error": "Video file not found at \(normalizedPath)"])
+          return
+        }
+
+        NSLog("[BRIDGE] session=%@ sampledFps=%.3f", sessionDir, sampledFps)
+
+        self.pipeline.run(
+          videoPath: normalizedPath,
           sessionDirectory: sessionDir,
           sampledFps: sampledFps,
           personStrategy: personStrategy,
@@ -53,7 +85,8 @@ import UIKit
               channel.invokeMethod("analysisProgress", arguments: ["status": status])
             }
           },
-          completion: { pipelineResult in
+          completion: { [weak self] pipelineResult in
+            guard let self = self else { return }
             DispatchQueue.main.async {
               switch pipelineResult {
               case let .success(summary):
@@ -104,6 +137,7 @@ import UIKit
                 if let motionInfo = motionInfo {
                   response["motionbert"] = motionInfo
                 }
+                logKeysOnce(response, tag: "BRIDGE_RESULT", onlyOnce: &self.shouldLogBridgeResultKeys)
                 result(response)
               case let .failure(error):
                 let response: [String: Any] = [
@@ -111,6 +145,7 @@ import UIKit
                   "stage": error.stage.rawValue,
                   "error": error.errorDescription ?? "Unknown error"
                 ]
+                logKeysOnce(response, tag: "BRIDGE_RESULT", onlyOnce: &self.shouldLogBridgeResultKeys)
                 result(response)
               }
             }

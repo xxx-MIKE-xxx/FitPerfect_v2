@@ -89,6 +89,7 @@ enum YOLOAnalysisError: Error {
 final class VideoYOLOAnalyzer {
     private let config: PipelineConfig
     private let yoloConfig: PipelineConfig.YOLO
+    private let debugConfig: PipelineConfig.Debug
     private var asset: AVAsset?
     private var track: AVAssetTrack?
     private var model: MLModel?
@@ -112,6 +113,7 @@ final class VideoYOLOAnalyzer {
     init(config: PipelineConfig, personStrategy: PersonSelectionStrategy = .bestScore) {
         self.config = config
         self.yoloConfig = config.yolo
+        self.debugConfig = config.debug
         self.personStrategy = personStrategy
         self.frameRotation = normalizedRotation(config.yolo.rotationCorrectionDeg)
     }
@@ -125,6 +127,19 @@ final class VideoYOLOAnalyzer {
         let asset = AVAsset(url: videoURL)
         self.asset = asset
 
+        let preloadKeys = ["tracks", "duration", "playable"]
+        let preloadGroup = DispatchGroup()
+        preloadGroup.enter()
+        asset.loadValuesAsynchronously(forKeys: preloadKeys) {
+            preloadGroup.leave()
+        }
+        preloadGroup.wait()
+        for key in preloadKeys {
+            var error: NSError?
+            let status = asset.statusOfValue(forKey: key, error: &error)
+            NSLog("[YOLO] asset key '%@' status=%d err=%@", key, status.rawValue, String(describing: error))
+        }
+
         guard let track = asset.tracks(withMediaType: .video).first else {
             throw YOLOAnalysisError.videoTrackUnavailable
         }
@@ -132,12 +147,27 @@ final class VideoYOLOAnalyzer {
 
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .all
-        guard let modelURL = Bundle.main.url(forResource: "best", withExtension: "mlpackage") else {
+        let mlmodelcURL = Bundle.main.url(forResource: "best", withExtension: "mlmodelc")
+        let mlpackageURL = Bundle.main.url(forResource: "best", withExtension: "mlpackage")
+        guard let modelURL = mlpackageURL ?? mlmodelcURL else {
+            NSLog("[YOLO] ERROR model resource missing mlmodelc=%@ mlpackage=%@",
+                  mlmodelcURL?.path ?? "nil", mlpackageURL?.path ?? "nil")
             throw YOLOAnalysisError.modelUnavailable
         }
         let yoloModel = try MLModel.load(contentsOf: modelURL, configuration: configuration)
         model = yoloModel
         visionModel = try VNCoreMLModel(for: yoloModel)
+        let modelSource = modelURL.pathExtension.lowercased() == "mlmodelc" ? "mlmodelc" : "mlpackage"
+        var inputSummary = "unknown"
+        if let desc = yoloModel.modelDescription.inputDescriptionsByName.values.first {
+            if let constraint = desc.imageConstraint {
+                inputSummary = "\(constraint.pixelsWide)x\(constraint.pixelsHigh)"
+            } else if let multi = desc.multiArrayConstraint {
+                let shape = multi.shape.map { Int(truncating: $0) }
+                inputSummary = shape.map { String($0) }.joined(separator: "x")
+            }
+        }
+        NSLog("[YOLO] model loaded (%@) computeUnits=%@ input=%@", modelSource, "all", inputSummary)
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -166,6 +196,12 @@ final class VideoYOLOAnalyzer {
         let rotation = frameRotation
 
         var sampleIndex = 0
+        NSLog("[YOLO] video=%dx%d duration=%.3fs baseFps=%.3f step=%d effective=%.3f",
+              videoWidth, videoHeight, durationSeconds, baseFps, frameStep, effectiveSampledFps)
+        if abs(effectiveSampledFps - targetSampledFps) > 0.001 {
+            NSLog("[YOLO] requested sampledFps=%.3f adjusted to %.3f", targetSampledFps, effectiveSampledFps)
+        }
+        var failedFrames = 0
         while true {
             let fi = sampleIndex * frameStep
             let timestamp = Double(fi) * frameDuration
@@ -187,6 +223,8 @@ final class VideoYOLOAnalyzer {
                     totalDetections += frame.boxes.count
                     frames.append(frame)
                 } else {
+                    failedFrames += 1
+                    NSLog("[YOLO] WARN fi=%d could not extract frame at t=%.3f", fi, timestamp)
                     // *** FIX: always include `selected` ***
                     let emptyFrame = YOLODetectionFrame(
                         fi: fi,
@@ -198,6 +236,21 @@ final class VideoYOLOAnalyzer {
                 }
             }
             sampleIndex += 1
+        }
+
+        if frames.isEmpty {
+            let reason: String
+            if durationSeconds <= 0 {
+                reason = "invalid_duration"
+            } else if baseFps <= 0 {
+                reason = "invalid_fps"
+            } else if failedFrames > 0 {
+                reason = "frame_extraction_failed"
+            } else {
+                reason = "unknown"
+            }
+            NSLog("[YOLO] WARN no frames processed (reason=%@ duration=%.3f baseFps=%.3f step=%d)",
+                  reason, durationSeconds, baseFps, frameStep)
         }
 
         let totals = YOLODetectionTotals(framesProcessed: frames.count, detections: totalDetections)
@@ -279,6 +332,7 @@ final class VideoYOLOAnalyzer {
         do {
             try handler.perform([request])
             guard let observations = request.results as? [VNRecognizedObjectObservation] else {
+                NSLog("[YOLO] fi=%d no recognized objects (no VN results)", frameIndex)
                 // *** FIX: always include `selected` ***
                 return YOLODetectionFrame(
                     fi: frameIndex,
@@ -286,6 +340,9 @@ final class VideoYOLOAnalyzer {
                     boxes: [],
                     selected: YOLOFrameSelection(strategy: personStrategy.rawValue, index: -1)
                 )
+            }
+            if observations.isEmpty {
+                NSLog("[YOLO] fi=%d no recognized objects", frameIndex)
             }
             let rotatedWidth = cgImage.width
             let rotatedHeight = cgImage.height
@@ -330,6 +387,13 @@ final class VideoYOLOAnalyzer {
             let selectedIndex = self.selectPersonIndex(in: boxes)
             let selection = YOLOFrameSelection(strategy: personStrategy.rawValue, index: selectedIndex)
 
+            if debugConfig.verboseLogging && every(frameIndex, debugConfig.frameLogStride) {
+                let preview = boxes.prefix(2).map {
+                    "\($0.label)#\($0.cls) s=\(String(format: "%.2f", $0.score)) xywh=(\($0.x),\($0.y),\($0.w),\($0.h))"
+                }.joined(separator: " | ")
+                NSLog("[YOLO] fi=%d boxes=%d sel=%d %@", frameIndex, boxes.count, selectedIndex, preview)
+            }
+
             return YOLODetectionFrame(
                 fi: frameIndex,
                 t: round(timestamp * 100) / 100,
@@ -337,6 +401,7 @@ final class VideoYOLOAnalyzer {
                 selected: selection
             )
         } catch {
+            NSLog("[YOLO] fi=%d vision error=%@", frameIndex, error.localizedDescription)
             return YOLODetectionFrame(
                 fi: frameIndex,
                 t: round(timestamp * 100) / 100,
@@ -459,11 +524,14 @@ final class RTMPoseAnalyzer {
     private let means: [Float]
     private let stds: [Float]
     private let minKeypointScore: Double
+    private let debugConfig: PipelineConfig.Debug
 
     private var model: RTMPose?
     private var asset: AVAsset?
     private var generator: AVAssetImageGenerator?
     private var lastSimccShapes: ([Int], [Int])?
+    private var shouldLogSimccShapes: Bool
+    private var loggedSimccShapeWarning = false
 
     // skeleton only for preview overlay
     private let skeletonPairs: [(Int, Int)] = [
@@ -483,6 +551,8 @@ final class RTMPoseAnalyzer {
         self.means = config.rtmpose.means.map { Float($0) }
         self.stds = config.rtmpose.stds.map { Float($0) }
         self.minKeypointScore = config.rtmpose.minKeypointScore
+        self.debugConfig = config.debug
+        self.shouldLogSimccShapes = config.debug.dumpModelOutputShapesOnce
     }
 
     func analyze(
@@ -494,6 +564,8 @@ final class RTMPoseAnalyzer {
         let yolo = try JSONDecoder().decode(YOLODetectionOutput.self, from: jsonData)
 
         lastSimccShapes = nil
+        shouldLogSimccShapes = debugConfig.dumpModelOutputShapesOnce
+        loggedSimccShapeWarning = false
 
         // Video + model
         let videoURL = URL(fileURLWithPath: videoPath)
@@ -526,10 +598,12 @@ final class RTMPoseAnalyzer {
         let metaRotation = yolo.meta?.rotationCorrectionDeg ?? 0
         let effectiveRotation = normalizedRotation(metaRotation + rotationOverrideDegrees)
 
-        // Log once at the start so you can tweak quickly
-        NSLog("[RTMPose] input=%dx%d simccRatio=%.1f padding=%.2f rotation=%d channelOrder=%@",
-              inputWidth, inputHeight, simccRatio,
-              paddingFactor, effectiveRotation, poseConfig.channelOrder)
+        if rotationOverrideDegrees != 0 {
+            NSLog("[RTMPose] rotation override=%d", rotationOverrideDegrees)
+        }
+        NSLog("[RTMPose] input=%dx%d simccRatio=%.1f pad=%.2f rot(meta=%d + override=%d -> used=%d) channel=%@",
+              inputWidth, inputHeight, simccRatio, paddingFactor,
+              metaRotation, rotationOverrideDegrees, effectiveRotation, poseConfig.channelOrder)
 
         for fr in yolo.frames {
             autoreleasepool {
@@ -561,12 +635,6 @@ final class RTMPoseAnalyzer {
                                       videoW: yolo.videoWidth, videoH: yolo.videoHeight,
                                       rotation: prep.rotation)
 
-                if lastSimccShapes == nil {
-                    let sx = out.simcc_x.shape.map { Int(truncating: $0) }
-                    let sy = out.simcc_y.shape.map { Int(truncating: $0) }
-                    NSLog("[RTMPose] simcc_x shape=%@  simcc_y shape=%@", String(describing: sx), String(describing: sy))
-                }
-
                 if kps.isEmpty {
                     frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: false, keypoints: []))
                     return
@@ -577,8 +645,15 @@ final class RTMPoseAnalyzer {
                 frames.append(RTMPoseFrame(fi: fr.fi, t: fr.t, ok: isStrong, keypoints: kps))
                 if isStrong { framesWithDetections += 1 }
 
+                if debugConfig.verboseLogging && every(fr.fi, debugConfig.frameLogStride) {
+                    let strong = kps.filter { $0.score >= minKeypointScore }.count
+                    NSLog("[RTMPose] fi=%d ok=%d strong=%d bbox=(%d,%d,%d,%d) cropPad=%.2f rot=%d",
+                          fr.fi, isStrong ? 1 : 0, strong, box.x, box.y, box.w, box.h, paddingFactor, effectiveRotation)
+                }
+
                 if isStrong, previewURL == nil, let p = try? self.renderPreview(baseImage: cgImage, keypoints: kps, outputURL: previewOutputURL) {
                     previewURL = p
+                    NSLog("[RTMPose] preview=%@", p.lastPathComponent)
                 }
             }
         }
@@ -615,6 +690,8 @@ final class RTMPoseAnalyzer {
         asset = nil
         model = nil
         lastSimccShapes = nil
+        shouldLogSimccShapes = false
+        loggedSimccShapeWarning = false
     }
 
     // ---------------- helpers ----------------
@@ -723,6 +800,18 @@ final class RTMPoseAnalyzer {
         let sx = X.strides.map { Int(truncating: $0) }
         let sy = Y.strides.map { Int(truncating: $0) }
         lastSimccShapes = (dx, dy)
+        if shouldLogSimccShapes {
+            shouldLogSimccShapes = false
+            NSLog("[RTMPose] simcc_x=%@ simcc_y=%@", String(describing: dx), String(describing: dy))
+            let allowed: Set<Int> = [17, 26, 29]
+            if !loggedSimccShapeWarning {
+                let combined = dx + dy
+                if combined.first(where: { allowed.contains($0) }) == nil {
+                    NSLog("[RTMPose] WARN unexpected simcc keypoint shape=%@", String(describing: combined))
+                    loggedSimccShapeWarning = true
+                }
+            }
+        }
 
         func dims(_ d: [Int]) -> (k: Int, w: Int, K: Int, W: Int) {
             let cand: Set<Int> = [17, 26, 29]
@@ -917,6 +1006,7 @@ struct MotionBERTSummary {
 final class MotionBERTAnalyzer {
     private let config: PipelineConfig
     private let motionConfig: PipelineConfig.MotionBERT
+    private let debugConfig: PipelineConfig.Debug
     private let temporalWindow: Int
     private let windowCenter: Int
     private let stride: Int
@@ -937,6 +1027,7 @@ final class MotionBERTAnalyzer {
     init(config: PipelineConfig) {
         self.config = config
         self.motionConfig = config.motionbert
+        self.debugConfig = config.debug
         self.temporalWindow = max(1, config.motionbert.temporalWindow)
         self.windowCenter = min(max(config.motionbert.center, 0), max(0, self.temporalWindow - 1))
         self.stride = max(1, config.motionbert.stride)
@@ -945,12 +1036,13 @@ final class MotionBERTAnalyzer {
     func analyze(sessionDirectory: String, postprocessResult: Postprocess2DResult) throws -> MotionBERTSummary? {
         let normalized = postprocessResult.normalizedOutput
 
-        NSLog("[MotionBERT] window=%d stride=%d skeleton=%@", temporalWindow, stride, motionConfig.skeleton)
+        NSLog("[MB] model computeUnits=NeuralEngine window=%d center=%d stride=%d skeleton=%@",
+              temporalWindow, windowCenter, stride, motionConfig.skeleton)
 
         let frames2D = prepareFrames(from: normalized.frames)
         let frameCount = frames2D.count
         if frameCount == 0 {
-            NSLog("[MotionBERT] No RTMPose frames found; skipping MotionBERT stage.")
+            NSLog("[MB] No RTMPose frames found; skipping MotionBERT stage.")
             return nil
         }
 
@@ -958,7 +1050,11 @@ final class MotionBERTAnalyzer {
         try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
         let outputURL = sessionURL.appendingPathComponent("motionbert_3d_keypoints.json")
 
-        guard let modelURL = Bundle.main.url(forResource: "motionbert_lite_patched", withExtension: "mlmodelc") else {
+        let mlmodelcURL = Bundle.main.url(forResource: "motionbert_lite_patched", withExtension: "mlmodelc")
+        let mlpackageURL = Bundle.main.url(forResource: "motionbert_lite_patched", withExtension: "mlpackage")
+        guard let modelURL = mlmodelcURL ?? mlpackageURL else {
+            NSLog("[MB] ERROR model resource missing mlmodelc=%@ mlpackage=%@",
+                  mlmodelcURL?.path ?? "nil", mlpackageURL?.path ?? "nil")
             throw MotionBERTError.modelResourceMissing
         }
 
@@ -970,7 +1066,8 @@ final class MotionBERTAnalyzer {
         }
 
         model = motionModel
-        NSLog("[MotionBERT] Model loaded (computeUnits=NeuralEngine) — running…")
+        NSLog("[MB] I/O shapes input=[1,%d,17,3] output=[1,%d,17,3]", temporalWindow, temporalWindow)
+        NSLog("[MB] Model loaded (computeUnits=NeuralEngine) — running…")
 
         var framesWith3D = 0
         var outputs: [MotionBERTFrameOutput] = []
@@ -990,6 +1087,9 @@ final class MotionBERTAnalyzer {
                 let timeIndex = padLeft + index
                 let joints3d = extractFrame(from: prediction, timeIndex: timeIndex)
                 outputs.append(MotionBERTFrameOutput(fi: frame.index, t: frame.timestamp, ok: true, keypoints3d: joints3d))
+                if debugConfig.verboseLogging && every(frame.index, debugConfig.frameLogStride) {
+                    NSLog("[MB] centerIdx=%d maps→ fi=%d t=%.3f", windowCenter, frame.index, frame.timestamp)
+                }
             }
             framesWith3D = frameCount
         } else {
@@ -1001,6 +1101,9 @@ final class MotionBERTAnalyzer {
                 }
                 let joints3d = self.extractFrame(from: prediction, timeIndex: windowCenter)
                 outputs.append(MotionBERTFrameOutput(fi: frames2D[i].index, t: frames2D[i].timestamp, ok: true, keypoints3d: joints3d))
+                if debugConfig.verboseLogging && every(i, debugConfig.frameLogStride) {
+                    NSLog("[MB] centerIdx=%d maps→ fi=%d t=%.3f", windowCenter, frames2D[i].index, frames2D[i].timestamp)
+                }
                 framesWith3D += 1
                 i += stride
             }
@@ -1029,7 +1132,7 @@ final class MotionBERTAnalyzer {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(jsonOutput).write(to: outputURL, options: .atomic)
 
-        NSLog("[MotionBERT] frames=%d ok=%d -> saved motionbert_3d_keypoints.json", frameCount, framesWith3D)
+        NSLog("[MB] frames=%d with3D=%d -> motionbert_3d_keypoints.json", frameCount, framesWith3D)
 
         return MotionBERTSummary(jsonURL: outputURL, previewURL: nil, totals: totals)
     }
@@ -1141,6 +1244,8 @@ final class VideoAnalysisPipeline {
     private let queue: DispatchQueue
     private let semaphore: DispatchSemaphore
 
+    var debugConfig: PipelineConfig.Debug { config.debug }
+
     init(config: PipelineConfig) {
         self.config = config
         self.queue = DispatchQueue(
@@ -1162,16 +1267,27 @@ final class VideoAnalysisPipeline {
         semaphore.wait()
         queue.async {
             defer { self.semaphore.signal() }
+            let runID = String(UUID().uuidString.prefix(8))
+            let startAll = CFAbsoluteTimeGetCurrent()
+            NSLog("[PIPELINE %s] start video=%@ session=%@ maxConc=%d",
+                  runID, redact(videoPath), sessionDirectory, self.config.runtime.maxConcurrentRuns)
+            var currentStage: VideoAnalysisStage = .yolo
             do {
                 progress?("Running YOLO…")
+                var t0 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] YOLO → start", runID)
                 let yoloSummary: YOLOAnalysisSummary = try autoreleasepool {
                     let a = VideoYOLOAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer { a.teardown() }
                     return try a.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, sampledFps: sampledFps)
                 }
-                NSLog("YOLO stage complete. frames=%d detections=%d", yoloSummary.totals.framesProcessed, yoloSummary.totals.detections)
+                var t1 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] YOLO ← done frames=%d detections=%d (%.3fs)",
+                      runID, yoloSummary.totals.framesProcessed, yoloSummary.totals.detections, t1 - t0)
 
                 progress?("Running RTMPose…")
+                t0 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] RTMPose → start", runID)
                 let poseSummary: RTMPoseSummary = try autoreleasepool {
                     var analyzer: RTMPoseAnalyzer? = RTMPoseAnalyzer(config: self.config, personStrategy: personStrategy)
                     defer {
@@ -1180,12 +1296,18 @@ final class VideoAnalysisPipeline {
                     }
                     return try analyzer!.analyze(videoAtPath: videoPath, sessionDirectory: sessionDirectory, yoloJSONURL: yoloSummary.jsonURL)
                 }
-                NSLog("RTMPose stage complete. frames=%d ok=%d", poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections)
+                t1 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] RTMPose ← done frames=%d ok=%d (%.3fs)",
+                      runID, poseSummary.totals.framesProcessed, poseSummary.totals.framesWithDetections, t1 - t0)
+                currentStage = .rtmpose
 
                 progress?("Refining 2D keypoints…")
+                t0 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] postprocess_2d → start", runID)
                 let postprocessResult: Postprocess2DResult = try autoreleasepool {
                     let processor = PosePostprocessor(
                         config: self.config.postprocess,
+                        debug: self.config.debug,
                         headTopFactor: self.config.motionbert.headTopFactor,
                         skeletonName: self.config.motionbert.skeleton
                     )
@@ -1193,6 +1315,7 @@ final class VideoAnalysisPipeline {
                     let decoded = try JSONDecoder().decode(RTMPoseJSONOutput.self, from: poseData)
                     return try processor.run(poseOutput: decoded, sessionDirectory: sessionDirectory)
                 }
+                let postElapsed = CFAbsoluteTimeGetCurrent() - t0
 
                 let postprocessSummary = Postprocess2DSummary(
                     refinedURL: postprocessResult.refinedJSONURL,
@@ -1202,9 +1325,17 @@ final class VideoAnalysisPipeline {
                     sampledFps: postprocessResult.refinedOutput.sampledFps,
                     numKeypoints: postprocessResult.refinedOutput.numKeypoints
                 )
+                NSLog("[PIPELINE %s] postprocess_2d ← done refined=%@ normalized=%@ (%.3fs)",
+                      runID,
+                      postprocessSummary.refinedURL.lastPathComponent,
+                      postprocessSummary.normalizedURL.lastPathComponent,
+                      postElapsed)
 
                 progress?("Running MotionBERT…")
                 NSLog("[MotionBERT] Releasing RTMPose and freeing memory…")
+                currentStage = .motionbert
+                t0 = CFAbsoluteTimeGetCurrent()
+                NSLog("[PIPELINE %s] MotionBERT → start", runID)
                 let motionSummary: MotionBERTSummary? = try autoreleasepool {
                     var analyzer: MotionBERTAnalyzer? = MotionBERTAnalyzer(config: self.config)
                     defer {
@@ -1213,18 +1344,31 @@ final class VideoAnalysisPipeline {
                     }
                     return try analyzer?.analyze(sessionDirectory: sessionDirectory, postprocessResult: postprocessResult)
                 }
+                if let mb = motionSummary {
+                    let elapsed = CFAbsoluteTimeGetCurrent() - t0
+                    NSLog("[PIPELINE %s] MotionBERT ← done frames=%d ok=%d (%.3fs)",
+                          runID, mb.totals.framesProcessed, mb.totals.framesWith3D, elapsed)
+                } else {
+                    NSLog("[PIPELINE %s] MotionBERT ← skipped (no frames)", runID)
+                }
 
                 completion(.success(VideoAnalysisResult(yolo: yoloSummary, rtmpose: poseSummary, postprocess: postprocessSummary, motionbert: motionSummary)))
+                NSLog("[PIPELINE %s] done (total=%.3fs)", runID, CFAbsoluteTimeGetCurrent() - startAll)
             } catch let e as VideoAnalysisStageError {
+                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, e.stage.rawValue, e.localizedDescription)
                 completion(.failure(e))
             } catch let e as YOLOAnalysisError {
+                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.yolo.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: e)))
             } catch let e as RTMPoseError {
+                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.rtmpose.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .rtmpose, underlying: e)))
             } catch let e as MotionBERTError {
+                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, VideoAnalysisStage.motionbert.rawValue, e.localizedDescription)
                 completion(.failure(VideoAnalysisStageError(stage: .motionbert, underlying: e)))
             } catch {
-                completion(.failure(VideoAnalysisStageError(stage: .yolo, underlying: error)))
+                NSLog("[PIPELINE %s] ERROR stage=%@ msg=%@", runID, currentStage.rawValue, error.localizedDescription)
+                completion(.failure(VideoAnalysisStageError(stage: currentStage, underlying: error)))
             }
         }
     }
@@ -1326,4 +1470,18 @@ private func clampRectToBounds(_ rect: CGRect, width: Int, height: Int) -> CGRec
     let maxY = min(max(0.0, rect.maxY), maxH)
 
     return CGRect(x: minX, y: minY, width: max(0.0, maxX - minX), height: max(0.0, maxY - minY))
+}
+
+@inline(__always) func redact(_ path: String) -> String {
+    return (path as NSString).lastPathComponent
+}
+
+@inline(__always) func every(_ i: Int, _ stride: Int) -> Bool {
+    return stride > 0 ? (i % stride == 0) : true
+}
+
+func logKeysOnce(_ dict: [String: Any], tag: String, onlyOnce: inout Bool) {
+    guard onlyOnce else { return }
+    onlyOnce = false
+    NSLog("[%@] output keys=%@", tag, dict.keys.sorted().joined(separator: ", "))
 }

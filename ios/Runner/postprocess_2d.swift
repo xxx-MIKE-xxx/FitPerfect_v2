@@ -63,11 +63,13 @@ struct Postprocess2DSummary {
 
 final class PosePostprocessor {
     private let config: PipelineConfig.Postprocess
+    private let debug: PipelineConfig.Debug
     private let headTopFactor: Double
     private let skeletonName: String
 
-    init(config: PipelineConfig.Postprocess, headTopFactor: Double, skeletonName: String) {
+    init(config: PipelineConfig.Postprocess, debug: PipelineConfig.Debug, headTopFactor: Double, skeletonName: String) {
         self.config = config
+        self.debug = debug
         self.headTopFactor = headTopFactor
         self.skeletonName = skeletonName
     }
@@ -80,6 +82,14 @@ final class PosePostprocessor {
         guard jointCount > 0 else {
             throw NSError(domain: "PosePostprocessor", code: -1, userInfo: [NSLocalizedDescriptionKey: "RTMPose output has no keypoints"])
         }
+
+        let normMode = config.normalize.enabled ? "enabled" : "disabled"
+        NSLog("[POST2D] refine interp=gap<=%d ma_win=%d score_thresh=%.3f norm=%@ bbox_ema=%.2f",
+              config.gapFill.maxInterpolatedGap,
+              config.globalMotion.window,
+              config.confidence.min,
+              normMode,
+              config.ema.alpha)
 
         struct JointSample {
             var point: SIMD3<Double>
@@ -95,6 +105,11 @@ final class PosePostprocessor {
                 frames[index][jointIndex] = JointSample(point: SIMD3<Double>(kp.x, kp.y, clampedScore), valid: kp.score >= config.confidence.min && frame.ok)
             }
         }
+
+        var totalGapsFilled = 0
+        var jointGapCounts = Array(repeating: 0, count: jointCount)
+        var firstMeta: (center: SIMD2<Double>, scale: Double)?
+        var lastMeta: (center: SIMD2<Double>, scale: Double)?
 
         // Gap filling via linear interpolation up to configured window
         if config.gapFill.maxInterpolatedGap > 0 {
@@ -123,6 +138,8 @@ final class PosePostprocessor {
                                 let interpolated = startVal + (endVal - startVal) * alpha
                                 frames[gapStart + step][joint].point = interpolated
                                 frames[gapStart + step][joint].valid = true
+                                totalGapsFilled += 1
+                                jointGapCounts[joint] += 1
                             }
                         }
                     }
@@ -197,13 +214,21 @@ final class PosePostprocessor {
             )
 
             let h36mJoints = convertToH36M(coco: refinedKeypoints)
-            let normalized = normalize(h36mJoints: h36mJoints)
+            let normalization = normalize(h36mJoints: h36mJoints)
+            if firstMeta == nil {
+                firstMeta = (normalization.center, normalization.scale)
+            }
+            lastMeta = (normalization.center, normalization.scale)
+            if debug.verboseLogging && every(frame.fi, debug.frameLogStride) {
+                NSLog("[POST2D] fi=%d center=(%.1f,%.1f) scale=%.3f",
+                      frame.fi, normalization.center.x, normalization.center.y, normalization.scale)
+            }
             h36mFrames.append(
                 H36MNormalizedFrame(
                     fi: frame.fi,
                     t: frame.t,
                     ok: frame.ok || hasValid,
-                    keypoints: normalized
+                    keypoints: normalization.values
                 )
             )
         }
@@ -232,6 +257,8 @@ final class PosePostprocessor {
             frames: h36mFrames
         )
 
+        NSLog("[POST2D] frames=%d refined=%d normalized=%d", frameCount, refinedFrames.count, h36mFrames.count)
+
         let sessionURL = URL(fileURLWithPath: sessionDirectory, isDirectory: true)
         try FileManager.default.createDirectory(at: sessionURL, withIntermediateDirectories: true)
 
@@ -245,6 +272,14 @@ final class PosePostprocessor {
 
         let normalizedData = try encoder.encode(normalizedOutput)
         try normalizedData.write(to: normalizedURL, options: .atomic)
+
+        NSLog("[POST2D] gapsFilled total=%d byJoint=%@", totalGapsFilled, compactJointGapHistogram(jointGapCounts))
+        if let firstMeta = firstMeta, let lastMeta = lastMeta {
+            NSLog("[POST2D] centers first=(%.1f,%.1f) last=(%.1f,%.1f) scale first=%.3f last=%.3f",
+                  firstMeta.center.x, firstMeta.center.y,
+                  lastMeta.center.x, lastMeta.center.y,
+                  firstMeta.scale, lastMeta.scale)
+        }
 
         return Postprocess2DResult(
             refinedJSONURL: refinedURL,
@@ -301,22 +336,32 @@ final class PosePostprocessor {
         return joints.map { SIMD3<Double>($0.x, $0.y, $0.score) }
     }
 
-    private func normalize(h36mJoints: [SIMD3<Double>]) -> [[Double]] {
-        guard config.normalize.enabled, h36mJoints.count >= 17 else {
-            return h36mJoints.map { [$0.x, $0.y, $0.z] }
-        }
+    private func compactJointGapHistogram(_ counts: [Int]) -> String {
+        let nonZero = counts.enumerated().filter { $0.element > 0 }
+        guard !nonZero.isEmpty else { return "{}" }
+        let parts = nonZero.map { "j\($0.offset)=\($0.element)" }
+        return "{\(parts.joined(separator: ","))}"
+    }
+
+    private func normalize(h36mJoints: [SIMD3<Double>]) -> (values: [[Double]], center: SIMD2<Double>, scale: Double) {
+        guard !h36mJoints.isEmpty else { return ([], SIMD2<Double>(repeating: 0), 1.0) }
 
         let rootIdx = max(0, min(config.normalize.rootJoint, h36mJoints.count - 1))
         let scaleA = max(0, min(config.normalize.scaleJointA, h36mJoints.count - 1))
         let scaleB = max(0, min(config.normalize.scaleJointB, h36mJoints.count - 1))
-
         let root = h36mJoints[rootIdx]
+        let center = SIMD2<Double>(root.x, root.y)
         let bone = simd_length(h36mJoints[scaleA] - h36mJoints[scaleB])
         let denom = max(bone, config.normalize.epsilon)
 
-        return h36mJoints.map { joint in
+        guard config.normalize.enabled, h36mJoints.count >= 17 else {
+            return (h36mJoints.map { [$0.x, $0.y, $0.z] }, center, denom)
+        }
+
+        let normalized = h36mJoints.map { joint -> [Double] in
             let centered = joint - root
             return [centered.x / denom, centered.y / denom, joint.z]
         }
+        return (normalized, center, denom)
     }
 }

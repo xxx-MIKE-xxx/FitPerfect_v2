@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../common/paths.dart';
+import 'package:path/path.dart' as p;
 import '../../models/exercise.dart';
 import '../../models/feedback_session.dart';
 
@@ -285,6 +286,7 @@ class _CameraPageState extends State<CameraPage> {
     required String videoPath,
     required Directory sessionDir,
   }) async {
+    debugPrint('[DART] analyze(video=${p.basename(videoPath)}, sampledFps=$_sampledFps)');
     final result = await _analysisChannel.invokeMapMethod<String, dynamic>(
       'runVideoAnalysis',
       {
@@ -293,6 +295,7 @@ class _CameraPageState extends State<CameraPage> {
         'sampledFps': _sampledFps,
       },
     );
+    debugPrint('[DART] analyze result keys=${result?.keys.toList()}');
 
     if (result == null) {
       throw StateError('Analysis returned no data');
